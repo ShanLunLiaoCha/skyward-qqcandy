@@ -156,7 +156,7 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
-        model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+        model: system.get(&cfg.device.model_prop).filter(|value| !value.is_empty()).unwrap_or_else(|| cfg.device.model.clone()),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
         cpu: cpu(Path::new(CPU))?,
@@ -237,11 +237,7 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
     parts.sort_by_key(|m| PROP_ORDER.iter().position(|b| *b == base(m)).unwrap_or(PROP_ORDER.len()));
     let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
     for m in &parts {
-        let files: &[&str] = match base(m).as_str() {
-            "system" => &["system/build.prop"],
-            "vendor" => &["default.prop", "build.prop"],
-            _ => &["etc/build.prop"],
-        };
+        let files = property_files(&base(m));
         for f in files {
             let path = m.mount_point.join(f);
             match fs::metadata(&path) {
@@ -254,6 +250,16 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
         }
     }
     Ok(props)
+}
+
+fn property_files(partition: &str) -> &'static [&'static str] {
+    match partition {
+        "system" => &["system/build.prop"],
+        "vendor" => &["default.prop", "build.prop"],
+        "odm" => &["build.prop", "etc/build.prop"],
+        name if name.starts_with("my_") => &["build.prop", "etc/build.prop"],
+        _ => &["etc/build.prop"],
+    }
 }
 
 fn read(path: impl AsRef<Path>) -> Result<String> {
@@ -390,21 +396,35 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
         "Unknown" => Charge::Unknown,
         other => bail!("{}: status {other:?}", dir.display()),
     };
+    // Oplus exposes a Battery facade with design/full=0 and voltage in mV,
+    // while its separate configfs design_capacity is explicitly batt_capacity_mah.
+    // Detect that exact interface; never infer units from small numbers alone.
+    let oplus = root.with_file_name("oplus_chg").join("battery");
+    let oplus_design = positive(parse_opt::<u64>(oplus.join("design_capacity"), "design_capacity")?);
+    let oplus_facade = dir.file_name().is_some_and(|name| name == "battery") && oplus_design.is_some()
+        && root.join("mtk-battery").is_dir();
+    let design = positive(parse_opt(dir.join("charge_full_design"), "charge_full_design")?)
+        .or_else(|| oplus_design.and_then(|mah| mah.checked_mul(1000)));
+    let full = positive(parse_opt(dir.join("charge_full"), "charge_full")?);
+    let voltage = positive(parse_opt::<u64>(dir.join("voltage_now"), "voltage_now")?);
+    let voltage = if oplus_facade { voltage.and_then(|mv| mv.checked_mul(1000)) } else { voltage };
     Ok(Some(Battery {
         level: parse(&read(dir.join("capacity"))?, "capacity")?,
         charge,
         temp: parse_opt(dir.join("temp"), "temp")?,
         health: read_opt(dir.join("health"))?,
         cycles: parse_opt(dir.join("cycle_count"), "cycle_count")?,
-        design: parse_opt(dir.join("charge_full_design"), "charge_full_design")?,
-        full: parse_opt(dir.join("charge_full"), "charge_full")?,
-        voltage: parse_opt(dir.join("voltage_now"), "voltage_now")?,
+        design,
+        full,
+        voltage,
         // How quickly the charger charges: 0 normally, then fast, flash,
         // turbo and super, which the stock SystemUI all counts quick.
         quick: parse_opt::<u8>(root.with_file_name("qcom-battery").join("quick_charge_type"), "quick_charge_type")?.is_some_and(|k| (1..=4).contains(&k)),
         plugged,
     }))
 }
+
+fn positive(value: Option<u64>) -> Option<u64> { value.filter(|value| *value > 0) }
 
 /// Whether the power supply in `dir` says a charger or a computer is
 /// attached to it.
@@ -429,6 +449,22 @@ fn said_online(read: std::io::Result<String>) -> std::io::Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn oplus_product_and_ota_properties_are_loaded_from_manifest_root() {
+        assert_eq!(property_files("my_manifest"), ["build.prop", "etc/build.prop"]);
+        assert_eq!(property_files("system"), ["system/build.prop"]);
+        let cfg=DeviceConfig::parse(include_str!("../../../devices/OP5911.toml")).unwrap();
+        assert_eq!(cfg.device.model_prop,"ro.product.name");
+        assert_eq!(cfg.device.os_version_prop,"ro.build.display.ota");
+        let mut props=HashMap::new();
+        props.insert("ro.product.name".into(),"一加 Ace 竞速版".into());
+        props.insert("ro.build.version.release".into(),"15".into());
+        props.insert("ro.build.display.ota".into(),"installed OTA label".into());
+        let system=SystemProps::Installed(props);
+        assert_eq!(system.get(&cfg.device.model_prop).as_deref(),Some("一加 Ace 竞速版"));
+        assert_eq!(system.get("ro.build.version.release").as_deref(),Some("15"));
+        assert_eq!(system.get(&cfg.device.os_version_prop).as_deref(),Some("installed OTA label"));
+    }
     #[test]
     fn cpulist_ranges_and_singles() {
         assert_eq!(cpulist("0-7").unwrap(), (0..8).collect::<Vec<_>>());
@@ -460,6 +496,18 @@ mod tests {
         assert!(!kernel_release().unwrap().is_empty());
     }
 
+    #[test]
+    fn oplus_facade_uses_live_design_mah_and_mv_without_faking_fcc() {
+        let class=tempfile::tempdir().unwrap();let supplies=class.path().join("power_supply");let bat=supplies.join("battery");fs::create_dir_all(&bat).unwrap();
+        for (name,value) in [("type","Battery"),("status","Charging"),("capacity","18"),("charge_full","0"),("charge_full_design","0"),("voltage_now","3800")] {fs::write(bat.join(name),value).unwrap();}
+        let no_marker=battery(&supplies).unwrap().unwrap();assert_eq!(no_marker.voltage,Some(3800));assert_eq!(no_marker.design,None);
+        let vendor=class.path().join("oplus_chg/battery");fs::create_dir_all(&vendor).unwrap();fs::write(vendor.join("design_capacity"),"5000").unwrap();
+        assert_eq!(battery(&supplies).unwrap().unwrap().voltage,Some(3800), "Oplus without MTK marker is not rescaled");
+        fs::create_dir_all(supplies.join("mtk-battery")).unwrap();
+        let oplus=battery(&supplies).unwrap().unwrap();assert_eq!(oplus.design,Some(5_000_000));assert_eq!(oplus.voltage,Some(3_800_000));assert_eq!(oplus.full,None);
+        fs::write(vendor.join("design_capacity"),"4873").unwrap();assert_eq!(battery(&supplies).unwrap().unwrap().design,Some(4_873_000));
+        fs::write(bat.join("charge_full_design"),"4900000").unwrap();assert_eq!(battery(&supplies).unwrap().unwrap().design,Some(4_900_000));
+    }
     #[test]
     fn a_battery_charged_quickly_says_so_beside_the_power_supplies() {
         // The 17 Ultra's in the recovery, on a charger it charges slowly on.

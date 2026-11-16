@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 /// Where a phone keeps the bundles of shared libraries its own partitions
 /// were built against.
-const BUNDLE_DIRS: [&str; 4] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex"];
+use crate::bundle_paths::DIRECTORIES as BUNDLE_DIRS;
 
 /// The file inside a bundle that holds its filesystem. It is stored whole,
 /// so the bundle can be opened where it lies.
@@ -171,13 +171,33 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
+    let Some(file) = crate::bundle_paths::find(name, BUNDLE_DIRS) else {
         return Ok(None);
     };
     let (offset, length) = image(&file)?;
-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
-    fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-    skyward_block::mount::mount_ro(&device, &at)?;
+    skyward_sys::kmsg(&format!("opening installed library bundle {} from {}", name, file.display()))?;
+    // The kernel loop holds its backing file even after every HAL stops.
+    // Stage exact payload bytes in tmpfs first so installation can release
+    // system_ext (VNDK) and system (runtime) without tearing down their users.
+    let backing = crate::apex_backing::stage(&file, offset, length, &crate::apex_backing::volatile_root()?)?;
+    skyward_sys::kmsg(&format!("library bundle {name} uses independent volatile backing {} ({length} bytes)", backing.display()))?;
+    let device = match skyward_block::loopdev::attach(&backing, 0, length) {
+        Ok(device) => device,
+        Err(error) => { let _ = fs::remove_file(&backing); return Err(error); }
+    };
+    let mounted = (|| -> Result<()> {
+        fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+        skyward_block::mount::mount_ro(&device, &at)?;
+        Ok(())
+    })();
+    if let Err(error) = mounted {
+        // Only the loop just created from this exact private backing is ours
+        // to clear. Never clear another loop or unlink a live backing blindly.
+        return Err(match skyward_block::loopdev::detach_owned(&device, &backing) {
+            Ok(()) => { let _ = fs::remove_file(&backing); error }
+            Err(cleanup) => error.context(format!("owned APEX loop cleanup failed; backing retained: {cleanup:#}")),
+        });
+    }
     Ok(Some(at))
 }
 
@@ -202,7 +222,7 @@ fn image(file: &Path) -> Result<(u64, u64)> {
 /// description of one program or in the one a whole partition shares, and
 /// the directory reads the whole of its description directory at once, so
 /// that one file it cannot make sense of leaves it describing nothing.
-pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
+pub fn publish_descriptions(wanted: &[String], required: &[String]) -> Result<()> {
     let into = Path::new(RECOVERY_DESCRIPTIONS);
     fs::create_dir_all(into).with_context(|| format!("make {}", into.display()))?;
     // Both directories read these as the users their init scripts name,
@@ -225,7 +245,13 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
         told.extend(services.iter().map(skyward_programs::description::Described::name));
     }
     let untold: Vec<String> = wanted.iter().filter(|name| !told.contains(name)).cloned().collect();
-    fs::write(&to, skyward_programs::description::offering(&untold)?).with_context(|| format!("write {}", to.display()))?;
+    let offered = skyward_programs::description::offering(&untold)?;
+    let changed = match fs::read_to_string(&to) {
+        Ok(previous) => previous != offered,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error).with_context(|| format!("read previous {}", to.display())),
+    };
+    fs::write(&to, &offered).with_context(|| format!("write {}", to.display()))?;
     fs::set_permissions(&to, std::os::unix::fs::PermissionsExt::from_mode(0o644)).with_context(|| format!("let every user read {}", to.display()))?;
     let rewritten = say_framework(into)?;
     // The directory reads the descriptions once and keeps to them, so one
@@ -236,13 +262,17 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
     let binder = skyward_binder::driver::Binder::open()?;
     // The first it does not know described settles that it starts again.
     let mut unknown = false;
-    for name in wanted {
+    // isDeclared is access-controlled independently of VINTF. A vendor
+    // manifest can contain unrelated services with no Recovery find label.
+    // Preserve them in the file, but only probe services we actually require;
+    // any refusal for a required service still fails closed.
+    for name in crate::declaration_policy::probes(wanted, required)? {
         if !skyward_binder::service::declared(&binder, name).with_context(|| format!("ask the service directory whether it knows {name} described"))? {
             unknown = true;
             break;
         }
     }
-    if unknown || rewritten > 0 {
+    if crate::declaration_policy::reload(changed, unknown, rewritten) {
         // It comes back knowing nothing of what had registered with it,
         // and nothing registers again by itself, so init starts each of
         // those services again, as the installed system's init does

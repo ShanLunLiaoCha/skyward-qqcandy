@@ -169,6 +169,15 @@ pub struct Plan {
 /// names the filesystem the system asked for it to be made as here.
 pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
     let plan = (|| -> Result<Result<Plan, Refusal>> {
+        // Installation deliberately releases vendor/odm/system mounts. Reopen
+        // the current slot read-only before reading its fstab or resolving
+        // formatters; never interpret missing mounts as an absent data entry,
+        // and never substitute stale pre-install filesystem/encryption flags.
+        if let Some(slot) = skyward_vab::current_slot()? {
+            let mounts = skyward_vab::mount_partitions(slot)
+                .context("restore current-slot read-only partition sources before factory-reset planning")?;
+            for damage in &mounts.damaged { skyward_sys::kmsg(&format!("reset planning super metadata: {damage}"))?; }
+        }
         if let Some(hold) = update_hold()? {
             return Ok(Err(Refusal::Update(hold)));
         }
@@ -204,49 +213,74 @@ fn update_hold() -> Result<Option<Hold>> {
 }
 
 impl Plan {
-    /// The parts, in the order they are erased.
+    /// The destructive parts, in their actual execution order.
     pub fn steps(&self) -> Vec<Step> {
-        let cache = self.cache.as_ref().map(|_| Step::Cache);
-        std::iter::once(Step::Data).chain(cache).chain(std::iter::once(Step::Metadata)).collect()
+        crate::reset_order::parts(self.cache.is_some()).into_iter().map(reset_step).collect()
     }
 
-    /// Erase each part, telling `tell` of each as it begins. The programs
-    /// holding the data partition end and the partition is closed; then it
-    /// is discarded whole, and the system makes it afresh under a new key
-    /// the next time it starts. Asked for another filesystem, every part is
-    /// made afresh as it here instead, as Android's own recovery makes them:
-    /// the data partition on the partition itself, which a system that
-    /// encrypts it whole encrypts again as it next starts. Unless
-    /// `keep_memtag_mode`, the memory tagging asked of the bootloader is
-    /// forgotten too.
+    /// Close data, format metadata, then format raw userdata. The original
+    /// metadata-dependent update/dual-system work must finish before keys go.
+    /// Once metadata is formatted, later failure cannot restore the old keys.
     pub fn carry_out(self, keep_memtag_mode: bool, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
-        tell(Event::At(Step::Data));
-        // The second system's boot set, and what keeps it, go with the data
-        // partition and /metadata: the installed system's goes back into
-        // the boot partitions first, while /metadata still tells where it
-        // is kept. One that does not mount keeps track of none.
-        if mount::is_mount_point(Path::new(METADATA)).map_err(failed(Step::Data))? {
-            skyward_systems::install::ensure_installed().map_err(failed(Step::Data))?;
+        if let Some(hold) = update_hold().map_err(failed(Step::Metadata))? {
+            return Err(Stop::Refused(Refusal::Update(hold)));
         }
+        let data_fs = self.reformat.as_deref().unwrap_or(&self.data.filesystem);
+        let metadata_device = PathBuf::from(fstab::device(&self.metadata).map_err(failed(Step::Metadata))?);
+        let data_device = PathBuf::from(fstab::device(&self.data).map_err(failed(Step::Data))?);
+        let cache_device = self.cache.as_ref().map(fstab::device).transpose().map_err(failed(Step::Cache))?.map(PathBuf::from);
+        validate_reset_devices(&metadata_device, &data_device, cache_device.as_deref()).map_err(failed(Step::Metadata))?;
+        // Resolve and validate ALL formatters before the first mkfs. Metadata
+        // and cache retain their own fstab filesystems even for a data override.
+        let metadata_format = erase::prepared(&metadata_device, &self.metadata.filesystem, &self.metadata.extras, false).map_err(failed(Step::Metadata))?;
+        let data_format = erase::prepared(&data_device, data_fs, &self.data.extras, casefolds(&self.data)).map_err(failed(Step::Data))?;
+        let cache_format = match (&self.cache, &cache_device) {
+            (Some(cache), Some(device)) => Some(erase::prepared(device, &cache.filesystem, &cache.extras, false).map_err(failed(Step::Cache))?),
+            _ => None,
+        };
+        if mount::is_mount_point(Path::new(METADATA)).map_err(failed(Step::Metadata))? {
+            skyward_systems::install::ensure_installed().map_err(failed(Step::Metadata))?;
+        }
+        // The UI has already withdrawn MTP and stopped owned secure services.
+        // Closing mappings while old metadata is intact must precede mkfs.
+        let _adb_pause = crate::wipe_adb::Pause::for_data_holders().map_err(failed(Step::Data))?;
         release_data().map_err(failed(Step::Data))?;
-        let device = fstab::device(&self.data).map_err(failed(Step::Data))?;
-        match &self.reformat {
-            Some(filesystem) => erase::make(Path::new(&device), filesystem, &self.data.extras, casefolds(&self.data)),
-            None => erase::discard(Path::new(&device)),
+        if mount::is_mount_point(Path::new(METADATA)).map_err(failed(Step::Metadata))? {
+            mount::umount(Path::new(METADATA)).map_err(failed(Step::Metadata))?;
         }
-        .map_err(failed(Step::Data))?;
-        let made_as = |entry: &Entry| self.reformat.clone().unwrap_or_else(|| entry.filesystem.clone());
-        if let Some(cache) = &self.cache {
-            tell(Event::At(Step::Cache));
-            remake_cache(cache, &made_as(cache)).map_err(failed(Step::Cache))?;
-        }
-        tell(Event::At(Step::Metadata));
-        remake(&self.metadata, &made_as(&self.metadata)).map_err(failed(Step::Metadata))?;
+        crate::reset_order::run(self.cache.is_some(), |part| -> Result<()> {
+            let step = reset_step(part);
+            tell(Event::At(step));
+            match part {
+                crate::reset_order::Part::Metadata => metadata_format.run(),
+                crate::reset_order::Part::Data => data_format.run().context("metadata has already been formatted and its old encryption keys are irreversibly lost; data formatting failed"),
+                crate::reset_order::Part::Cache => {
+                    let cache = self.cache.as_ref().expect("cache stage requires cache entry");
+                    remake_cache_using(cache, &cache.filesystem, cache_format.as_ref()).context("metadata and data were formatted; cache formatting failed")
+                }
+            }
+        }).map_err(|(part, error)| Stop::Failed(reset_step(part), error))?;
         if !keep_memtag_mode {
             bcb::forget_memtag_mode(&bcb::misc()).map_err(failed(Step::Metadata))?;
         }
         Ok(())
     }
+}
+
+fn reset_step(part: crate::reset_order::Part) -> Step {
+    match part { crate::reset_order::Part::Metadata => Step::Metadata, crate::reset_order::Part::Data => Step::Data, crate::reset_order::Part::Cache => Step::Cache }
+}
+
+fn validate_reset_devices(metadata: &Path, data: &Path, cache: Option<&Path>) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut identities = Vec::new();
+    for device in std::iter::once(metadata).chain(std::iter::once(data)).chain(cache) {
+        let node = fs::metadata(device).with_context(|| format!("stat reset partition {}", device.display()))?;
+        ensure!(node.file_type().is_block_device(), "reset target is not a block device: {}", device.display());
+        ensure!(!identities.contains(&node.rdev()), "factory reset partitions resolve to the same block device");
+        identities.push(node.rdev());
+    }
+    Ok(())
 }
 
 /// Parts erased on their own: what the data partition holds, each part as
@@ -690,10 +724,20 @@ fn give(path: &Path, look: &Look) -> Result<()> {
 /// permissions and labels they had. A partition that no longer mounts has
 /// none to keep.
 pub fn remake_cache(entry: &Entry, filesystem: &str) -> Result<()> {
+    remake_cache_using(entry, filesystem, None)
+}
+
+fn remake_cache_using(entry: &Entry, filesystem: &str, prepared: Option<&erase::PreparedFormat>) -> Result<()> {
     let at = Path::new(&entry.mount_point);
     let device = PathBuf::from(fstab::device(entry)?);
     let kept = read_logs(&device, at)?;
-    remake(entry, filesystem)?;
+    match prepared {
+        Some(format) => {
+            if mount::is_mount_point(at)? { mount::umount(at)?; }
+            format.run()?;
+        }
+        None => remake(entry, filesystem)?,
+    }
     let Some((folder, logs)) = kept else { return Ok(()) };
     fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
     // The table's options are for the filesystem it names.

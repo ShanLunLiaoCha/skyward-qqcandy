@@ -200,6 +200,9 @@ impl Inputs {
             return Err(io::Error::last_os_error()).context("create inotify instance");
         }
         let watch = unsafe { OwnedFd::from_raw_fd(fd) };
+        // ueventd may not have created this volatile directory yet. Creating
+        // it never touches userdata and lets the late-device watcher attach.
+        fs::create_dir_all("/dev/input").context("create volatile input directory")?;
         let dir = CString::new("/dev/input")?;
         // IN_ATTRIB too: ueventd sets a node's owner and mode right after
         // creating it, and the node may only open once that is done.
@@ -241,8 +244,18 @@ impl Inputs {
             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
             eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
             if direct && mt && self.panel.is_none() {
-                self.wakeful.add(dev.as_raw_fd())?;
-                self.panel = Some(Panel::new(path, dev)?);
+                let panel = match Panel::new(path.clone(), dev) {
+                    Ok(panel) => panel,
+                    Err(error) => {
+                        // A raw/temporarily unready controller must not take
+                        // down a display that can still be used with keys.
+                        eprintln!("input {} rejected; retaining key-only UI: {error:#}", path.display());
+                        self.seen.remove(&path);
+                        continue;
+                    }
+                };
+                self.wakeful.add(panel.dev.as_raw_fd())?;
+                self.panel = Some(panel);
                 for w in &self.touch_writes {
                     fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
                     skyward_sys::kmsg(&format!("wrote {} to {} for the touchscreen", w.value, w.path))?;
@@ -262,10 +275,11 @@ impl Inputs {
         let mut any = false;
         loop {
             let n = unsafe { libc::read(self.watch.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n >= 0 {
+            if n > 0 {
                 any = true;
                 continue;
             }
+            if n == 0 { return Ok(any); }
             let err = io::Error::last_os_error();
             match err.kind() {
                 ErrorKind::WouldBlock => return Ok(any),
@@ -312,6 +326,7 @@ impl Inputs {
                         if let EventSummary::Key(_, code, value @ (0 | 1)) = e.destructure()
                             && let Some(k) = key_of(code)
                         {
+                            eprintln!("input key {:?} down={} at {} ms", k, value == 1, monotonic_ms());
                             out.push(Event::Key(k, value == 1));
                         }
                     }

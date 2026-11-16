@@ -1,269 +1,104 @@
-![Skyward Recovery](assets/hero.jpg)
+![Skyward](assets/hero.jpg)
 
-# Skyward
+# Skyward for OnePlus Ace Racing Edition · qqcandy
 
 English | [简体中文](README.zh-CN.md)
 
-Skyward is a recovery written in Rust, from scratch.
+An **unofficial, experimental device port** of [Skyward](https://github.com/kirklin/skyward), a recovery written in Rust. This repository is named **skyward-qqcandy** and contains the modified source, device configuration and image-building tools for the OnePlus Ace Racing Edition. It is not an official OnePlus or upstream Skyward release.
 
-<p align="center">
-  <img src="assets/home.png" width="30%" alt="Home">
-  <img src="assets/settings-dark.png" width="30%" alt="Settings in dark mode">
-  <img src="assets/time-zone.png" width="30%" alt="Time zone">
-</p>
+## Device and status
 
-## Features
-
-### Dual boot
-
-![One phone holds two systems](slides/en/out/01-dual-boot.png)
-
-![A switch rewrites only two partitions](slides/en/out/02-dual-boot-partitions.png)
-
-How a second system is packaged and started is in
-[How dual boot works](#how-dual-boot-works).
-
-### Decryption
-
-![Decrypt data with the screen lock](slides/en/out/03-decrypt.png)
-
-### Installing
-
-![Four kinds of packages from three places](slides/en/out/04-install.png)
-
-Install scripts get `7za` and `zstd`, which ROMs with a super image compressed by
-zstd use to flash it, and an `unzip` whose `-p` streams the image as it reads it.
-They also get `avbctl` and `resetprop`, to turn off verified boot's checks and to
-read and set properties.
-
-### Online updates
-
-![Update the system and Skyward online](slides/en/out/05-updates.png)
-
-### Backup and restore
-
-![Back up the system, apps and IMEI](slides/en/out/06-backup.png)
-
-### File manager
-
-![Manage the phone's files in Skyward](slides/en/out/07-files.png)
-
-### Terminal
-
-![Run a root shell right on the phone](slides/en/out/08-terminal.png)
-
-### Connecting a computer
-
-![Move files and flash partitions over USB](slides/en/out/09-computer.png)
-
-### Wiping data
-
-![Every choice says what it wipes](slides/en/out/10-wipe.png)
-
-### Replacing the stock recovery
-
-![Skyward does what the system asks](slides/en/out/11-requests.png)
-
-### Search
-
-![Type a few letters to find a feature](slides/en/out/12-search.png)
-
-### Advanced
-
-![When something breaks, fix it here first](slides/en/out/13-tools.png)
-
-### About phone
-
-![Check battery health and charge cycles](slides/en/out/14-specs.png)
-
-### Other features
-
-- Reboot to system, recovery, fastboot, bootloader or EDL, and switch slots
-- Light and dark themes; Simplified Chinese, Traditional Chinese and English
-
-### Without a system
-
-![Skyward starts even without a system](slides/en/out/15-no-system.png)
-
-## Supported devices
-
-| Device | Codename | Tested system version |
-| --- | --- | --- |
-| Xiaomi 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM (Android 17) |
-| Xiaomi 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM (Android 16) |
-
-### 🚧 Under construction
-
-These images are built from each phone's stock firmware and have not been tried
-on the phone. They set up the screen, touch, Wi-Fi and vibration. The programs that
-decrypting the data partition takes are read on the phone from the installed
-system's own init scripts and service descriptions; what is read has been checked
-against each model's stock firmware, and how those programs run on these models has
-not been verified.
-
-| Device | Codename | Built on |
-| --- | --- | --- |
-| 🚧 Xiaomi 13 | `fuxi` | OS3.0.309.0.WMCCNXM (Android 16) |
-| 🚧 Xiaomi 13 Pro | `nuwa` | OS3.0.312.0.WMBCNXM (Android 16) |
-| 🚧 Xiaomi 14 | `houji` | OS3.0.307.0.WNCCNXM (Android 16) |
-| 🚧 Xiaomi 14 Pro | `shennong` | OS3.0.309.0.WNBCNXM (Android 16) |
-| 🚧 Xiaomi 14 Ultra | `aurora` | OS3.0.308.0.WNACNXM (Android 16) |
-| 🚧 Xiaomi 15 | `dada` | OS3.0.307.0.WOCCNXM (Android 16) |
-| 🚧 Xiaomi 15 Pro | `haotian` | OS3.0.309.0.WOBCNXM (Android 16) |
-| 🚧 Xiaomi 15 Ultra | `xuanyuan` | OS3.0.314.0.WOACNXM (Android 16) |
-| 🚧 Xiaomi 17 | `pudding` | OS4.0.4.0.XPCCNXM (Android 17) |
-| 🚧 Xiaomi 17 Pro | `pandora` | OS4.0.4.0.XBLCNXM (Android 17) |
-| 🚧 Xiaomi 17 Pro Max | `popsicle` | OS4.0.4.0.XPBCNXM (Android 17) |
-| 🚧 Xiaomi 17 Max | `byron` | OS3.0.310.0.WAFCNXM (Android 16) |
-| 🚧 REDMI K80 | `zorn` | OS3.0.309.0.WOKCNXM (Android 16) |
-| 🚧 REDMI K80 Pro | `miro` | OS3.0.305.0.WOMCNXM (Android 16) |
-| 🚧 REDMI K90 | `annibale` | OS3.0.307.0.WPKCNXM (Android 16) |
-| 🚧 REDMI K90 Pro Max | `myron` | OS4.0.4.0.XPMCNXM (Android 17) |
-| 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM (Android 16) |
-| 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM (Android 17) |
-| 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM (Android 17) |
-
-## Installing Skyward
-
-Skyward needs an unlocked bootloader. Download the zip for your phone from
-[Releases](https://github.com/kirklin/skyward/releases), where each shows as the
-phone's model and codename, such as Xiaomi 17 Ultra (nezha). Check it against
-`SHA256SUMS`, unzip it, and flash the image inside to the recovery partition of
-the slot the phone runs from, with the phone in fastboot mode:
-
-```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
-fastboot reboot recovery
-```
-
-Afterwards Skyward updates itself over Wi-Fi from its newest release, on the
-Skyward update page in Settings; a newer image, unzipped, also installs from its own
-Install page. With **Flash Skyward again** on, a system update or zip that writes
-over the recovery partitions gets Skyward back in them.
-
-adb in Skyward is a root shell that needs no authorization on the phone: anyone
-with the phone and a cable can reach its storage while it is in recovery.
-
-## How dual boot works
-
-Skyward installs a second system beside the one in the phone's own partitions,
-whether that is HyperOS or a custom ROM, and switches between them from **Dual boot**
-on its home page. The second system's root is a file in the data partition that the
-filesystem may neither move nor delete, read and written through the partition
-itself; the boot images of both systems are kept in another such file. A switch
-writes only the boot and init_boot partitions of the slot that starts next, and
-keeps each step on /metadata first, so a switch cut off by a loss of power is
-finished when Skyward next starts. vendor_boot, dtbo, recovery, vbmeta, the firmware
-and super stay as they are, and the second system starts with the installed
-system's vendor_boot and dtbo.
-
-Before anything else writes the boot partitions, Skyward puts the installed system's
-boot images back: an install, a slot switch, fastboot, a factory reset, and a backup
-or restore of the boot partitions. The second system waits while a system update is
-still to be merged, and backups of the data partition leave it out.
-
-A second system installs from a zip on the Install page, as any other package does:
-
-| File | What it holds |
+| Item | Value |
 | --- | --- |
-| `system.toml` | `id`, `name`, `version` and `filesystem`; `init`, the program the root starts with, `/sbin/init` unless given; `minimum`, the least room the root takes, in bytes |
-| `boot.img` | The kernel the bootloader starts |
-| `rootfs.img` | The root filesystem's image, of the `filesystem` named |
-| `init_boot.img` | Only for a system with a first ramdisk of its own |
+| Device | OnePlus Ace Racing Edition / 一加 Ace 竞速版 |
+| Model | PGZ110 |
+| Device codename | `qqcandy` (provided by the port maintainer) |
+| Internal configuration identifier | `OP5911` — retained for existing runtime/tool safety checks |
+| SoC | MediaTek Dimensity 8100-MAX |
+| Firmware baseline | ColorOS 15 / Android 15 — `PGZ110_15.0.0.1600(CN01)` |
+| Stock kernel baseline | Official stock kernel `5.10.236` |
+| Recovery image partition | `vendor_boot` (A/B); **not a standalone `recovery` partition** |
+| Upstream source baseline | [`c5e09f6`](https://github.com/kirklin/skyward/commit/c5e09f6eb644e75e051b309f98d6745ccbc97d81) |
 
-A system without an init_boot image of its own starts from one Skyward makes. Its
-program loads the installed system's first-stage kernel modules the way that
-system's first stage loads them, with their soft dependencies and the settings the
-kernel command line gives them, finds the root in the data partition, mounts it and
-starts `init` there. If anything stops it, it brings Skyward up, as a failed start
-of the installed system ends in the recovery: it leaves the reason in misc, unpacks
-the ramdisk of the slot's recovery partition over its own, as the kernel unpacks it
-when the bootloader starts the recovery, and hands over to Skyward's first program,
-so Skyward comes up however the bootloader treats a restart. Skyward shows why, and
-the second system still starts next until the user switches on Dual boot. A start
-that stops moving restarts into the recovery instead, and a phone restarted before
-the hand-over finds the same request in misc at its next start, which brings
-Skyward up before anything else. Where Skyward comes up neither way, the phone stays
-where it stopped, and never starts the same again and again. A system with a first
-ramdisk of its own finds Skyward's program at `/skyward/map`, which lays the root
-out as a block device and prints its node. Each switch to the second system writes
-its init_boot image with the program of the Skyward that switches, so an updated
-Skyward starts it with the new program.
+The port includes changes for MediaTek/Trustonic decryption services, display resume and backlight, touch/keys, LED-class haptics, Wi-Fi calibration/bootstrap, USB/MTP, startup and partition/wipe policies. These are source-level adaptations, **not a claim that every feature works on the phone**.
 
-A running system switches by writing `boot-recovery` with
-`--switch_system=installed`, or `--switch_system=` and the second system's `id`, to
-misc, and restarting into recovery. Where the bootloader starts the slot again, as
-the 13 Ultra's can with a USB cable in, Skyward's program finds the request in misc
-at the next start and brings Skyward up before anything else.
+Existing handover notes report successful compilation and host tests, and earlier device observations of data decryption and manual Wi-Fi connectivity. The raw logs are deliberately not part of this public tree; these reports have not been independently reproduced during repository cleanup. OTA installation, APEX RAM backing, reuse of existing device-mapper mappings, dual boot, and general ROM compatibility are **not established** for this device. Other device files are inherited upstream references, not additional support claims by this port.
 
-## Building
+## Safety
 
-Skyward builds with the version of Rust that `rust-toolchain.toml` names, with its
-`aarch64-linux-android` target, the Android NDK r29 and
-[cargo-ndk](https://github.com/bbqsrc/cargo-ndk). The recovery service is built for
-the phone, and the packer for the computer:
+- Unlocking, flashing, decryption and formatting can cause permanent data loss or an unbootable device. Keep independent backups and the matching stock firmware/recovery path.
+- Do not use upstream Xiaomi `fastboot flash recovery` instructions on this phone. No generic flashing command is supplied here: verify the firmware, partition layout, slot and recovery method first.
+- Stock init, filesystem checks and Trustonic services may write to persistent storage. Recovery and diagnostic modes are **not read-only**.
+- “All data” follows the port's close-data → format-metadata → format-data policy. Formatting metadata destroys encryption keys and cannot be undone.
+- Debug image tools enable root/debug services and use an explicitly supplied ADB public key. Do not ship a personal key, raw device logs, Wi-Fi credentials or a debug image as a secure production build.
+- Xiaomi-specific online update behavior inherited from upstream is not a supported update channel for this OnePlus port.
 
-```sh
-cargo ndk -t arm64-v8a --platform 30 build --release -p skyward
-cargo build --release -p skyward-pack
+## Repository layout
+
+```text
+crates/          Skyward workspace and device-port changes; source tests retained
+ devices/        Upstream device definitions and OP5911 configurations
+ tools/          PGZ110 vendor_boot packaging and supporting scripts
+ resources/      Font resources and their individual license notices
+ assets/, slides/  Upstream artwork and feature illustrations
 ```
 
-The second system's first program runs before any library is there to load, so it
-is built as a static program:
+Use [`devices/OP5911.toml`](devices/OP5911.toml) for the main configuration. [`devices/OP5911-decrypt.experimental.toml`](devices/OP5911-decrypt.experimental.toml) and [`devices/OP5911-boot.toml`](devices/OP5911-boot.toml) are alternative experimental configurations, not interchangeable stable profiles. `qqcandy` is the public device/repository name; do not globally rename `OP5911`, which existing safety checks rely on.
+
+## Building from source
+
+Use Linux or WSL2 with the checkout and NDK on the Linux filesystem. Requirements: the Rust version in [`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.100.0`), `aarch64-linux-android`, Android NDK r29, and Python 3. Image packaging also requires `lz4`, AOSP `avbtool`, a matching stock `vendor_boot.img`, and the bundled font resources under their individual licenses. This is **not an offline, dependency-free build bundle**.
+
+From the repository root:
 
 ```sh
-RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --release -p skyward-system-init --target-dir target/system-init
+export ANDROID_NDK_HOME=/path/to/android-ndk-r29
+export SKYWARD_SOURCE="$PWD"
+sh tools/build_android.sh
 ```
 
-The packer takes the stock recovery partition out of the build's full update
-package on Xiaomi's server, reading only the part of the package the partition is
-in, and checks its SHA-256 against the device file:
+The helper builds `skyward` for Android API 30 and runs selected host-side library tests. It does not flash a phone. Dependencies must be obtainable using [`Cargo.lock`](Cargo.lock). A build log or host test pass does not establish on-device safety. To run only those selected tests:
 
 ```sh
-target/release/skyward-pack stock --config devices/nezha.toml --out target/stock/nezha/recovery.img
+cargo test --locked -p skyward-config -p skyward-crypto -p skyward-install -p skyward-systems --lib
 ```
 
-Then it builds the image on top of it:
+Do not blindly run device tests: some tests format filesystems, mount partitions or manipulate encryption keys.
+
+### Packaging vendor_boot
+
+[`tools/vendor_boot.py`](tools/vendor_boot.py) rebuilds the matching stock image while checking its structure and preserving the DTB, ramdisk layout and stock components. It rejects unknown init templates; do not remove those checks to force support for another firmware.
 
 ```sh
-target/release/skyward-pack recovery \
-  --stock target/stock/nezha/recovery.img \
+python3 tools/vendor_boot.py build --help
+python3 tools/vendor_boot.py inspect --stock /path/to/matching/vendor_boot.img
+
+mkdir -p out
+python3 tools/vendor_boot.py build \
+  --stock /path/to/matching/vendor_boot.img \
   --binary target/aarch64-linux-android/release/skyward \
-  --system-init target/system-init/aarch64-linux-android/release/system-init \
-  --config devices/nezha.toml \
+  --config devices/OP5911.toml \
   --font resources/fonts/MiSansVF.ttf \
   --mono resources/fonts/KirkMono-Regular.ttf \
   --mono-license resources/fonts/KirkMono-OFL.txt \
-  --out target/skyward-nezha.img
+  --avbtool /path/to/avbtool.py \
+  --ack-experimental --ack-stock-init-writes \
+  --allow-unified-platform-fragment \
+  --out out/skyward-qqcandy-vendor_boot.img
 ```
 
-Tests and lints run on the computer; what runs only on the phone is linted for it:
+This is a packaging example, **not a flashing guide or a tested-release guarantee**. `--allow-unified-platform-fragment` is specific to the audited layout; use it only for a matching image. If the stock image lacks an AVB footer, the tool also requires the verified partition size. Output uses an unsigned AVB hash footer (`algorithm NONE`), not an OEM signature. The script never flashes a device.
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo ndk -t arm64-v8a --platform 30 clippy --workspace --all-targets -- -D warnings
-```
+Optional userdebug, OTA extraction and Wi-Fi helper scripts remain available for development. Inspect each script and its `--help` before use. GitHub Actions is manual and checks/builds source only; it does not download stock firmware, package images or publish releases.
 
-The tests whose names start with `on_the_phone` make filesystems, mount them and
-set encryption keys, which only a phone does. With a phone in Skyward attached over
-adb, its data partition open, `cargo ndk` pushes each test program to the phone and
-runs it there, one test at a time:
+## Upstream, modifications and licensing
 
-```sh
-cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
-```
+Skyward is by [kirklin and upstream contributors](https://github.com/kirklin/skyward/graphs/contributors). Original names, copyright notices and the unmodified [`LICENSE`](LICENSE) are retained. The workspace declares **GPL-3.0-or-later**; the device adaptation is distributed under the same license. No upstream endorsement is implied.
 
-`skyward-preview` draws the pages on the computer, as PNG files, without a phone:
-each page whole, as a long screenshot shows it, in the states it can be in, and the
-screen at moments of touches and motion. `--lang` picks the language by a locale
-such as `en` or `zh-TW`:
+See [`NOTICE.md`](NOTICE.md) for the dated modification notice and third-party distribution requirements. Third-party libraries and fonts keep their own licenses. The interface uses Xiaomi MiSans, retained unchanged as a Skyward resource and not offered as a standalone font distribution. Its separate [license agreement](resources/fonts/MiSans-LICENSE.txt), reproduced from [Xiaomi](https://hyperos.mi.com/font/download), is not the GPL and must be respected. Kirk Mono and its OFL notice remain together.
 
-```sh
-cargo run --release -p skyward-preview -- target/preview --lang en
-```
+Before distributing compiled binaries or images, supply the complete corresponding source and required third-party notices/licenses for that exact build, including relevant build scripts and dependencies under their applicable licenses. A lockfile or a reference to a previously delivered private archive is not a substitute. Stock firmware, proprietary runtime files and a third-party redistribution grant are not supplied here.
 
-## License
+## Reporting issues
 
-[GPL-3.0-or-later](LICENSE)
+Include the model, firmware build, source revision, selected configuration and a minimal reproduction. Redact serial numbers, keys, Wi-Fi information and personal data from logs. Do not test destructive operations merely to prepare an issue report.

@@ -1189,6 +1189,7 @@ pub struct App {
     backdrop: Option<Canvas>,
     /// How round the screen's corners are, in pixels.
     corners: f32,
+    clock_offset_dp: f32,
     dirty: bool,
     w: u32,
     h: u32,
@@ -1255,6 +1256,7 @@ impl App {
             cols: 0,
             backdrop: None,
             corners: 0.0,
+            clock_offset_dp: 0.0,
             dirty: true,
             w,
             h,
@@ -1268,12 +1270,19 @@ impl App {
         self.corners = radius;
     }
 
+    pub fn set_clock_offset_dp(&mut self, offset: f32) {
+        self.clock_offset_dp = if offset.is_finite() { offset.clamp(0.0, 80.0) } else { 0.0 };
+        self.dirty = true;
+    }
+
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
+        let mut theme = if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
-        }
+        };
+        theme.m.status_x += self.clock_offset_dp * self.px_per_dp;
+        theme
     }
 
     pub fn screen(&self) -> Screen {

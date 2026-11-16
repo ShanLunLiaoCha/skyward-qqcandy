@@ -1,0 +1,85 @@
+# PGZ110 Android 15 experimental decryption bring-up, NOT a tested release.
+# Requires patched Skyward and intact pre-existing secure storage.
+[device]
+codename = "OP5911"
+brand = "OnePlus"
+model = "PGZ110"
+ab = true
+recovery_partition = "vendor_boot"
+binder_header = "system"
+hidl_manager_root = true
+auto_open_data = true
+soc = { hans = "天玑 8100-MAX", hant = "天璣 8100-MAX", en = "Dimensity 8100-MAX" }
+model_prop = "ro.product.name"
+os_version_prop = "ro.build.display.ota"
+
+[display]
+width = 0
+height = 0
+density = 480
+clock_offset_dp = 20
+resume_mode = "running"
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = []
+
+[partitions]
+mounted = []
+
+[backup]
+efs = ["nvram", "nvdata", "nvcfg", "protect1", "protect2", "persist"]
+data_skipped = ["vendor/mcRegistry", "vendor/tee", "vendor/keymaster", "vendor/gatekeeper"]
+
+# Persistent-write opt-in. DO NOT combine with --diagnostic-init (persist ro).
+# Refuses missing/empty/symlinked Store_1.tf, already-running daemon and readonly
+# persist; does not create/chown/chmod secure files or use --sfs-reformat.
+# FSD can still write an existing store; this is NOT a readonly diagnosis.
+[trustonic]
+allow_persistent_writes = true
+libraries = ["/system/lib64", "/vendor/lib64"]
+
+
+# MTK conninfra + connac2 power control; no shared connectivity modules unloaded.
+[wlan]
+protocol = "hidl"
+modules = ["wmt_chrdev_wifi_connac2", "wlan_drv_gen4m_6895"]
+# Register BT only AFTER the existing Wi-Fi calibration buffer reaches RAM.
+calibration_modules = ["bt_drv_6895"]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+service = "android.hardware.wifi.supplicant@1.4::ISupplicant/default"
+probe = "http://connectivitycheck.gstatic.com/generate_204"
+
+[wlan.bootstrap]
+modules = ["conninfra"]
+program = "/vendor/bin/conninfra_loader"
+ready_property = "vendor.connsys.driver.ready"
+ready_value = "yes"
+libraries = ["/system/lib64", "/vendor/lib64"]
+
+[wlan.power]
+path = "/dev/wmtWifi"
+on = "1"
+off = "0"
+
+[wlan.nvram]
+partition = "nvdata"
+directory = "APCFG/APRDEB"
+file = "WIFI"
+selector = "/data/vendor/nvramwifi"
+device = "/dev/wmtWifi"
+
+
+# Audited AW8697 815 LED-class driver; no input force-feedback device exists.
+[haptics]
+backend = "aw8697_led"
+resonance = "/sys/class/leds/vibrator/f0"
+strength = { lightest = 0.25, strongest = 0.75 }
+
+[haptics.led]
+path = "/sys/class/leds/vibrator"
+click_ms = 18
+ticks_ms = 30
+max_gain = 128

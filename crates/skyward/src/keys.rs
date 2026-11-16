@@ -112,6 +112,25 @@ pub fn start(steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
+/// Start the key chain with cancellable ownership. Partial failures stop all
+/// children already spawned by this chain, never an unrelated pre-existing PID.
+/// The in-process secure-element server still uses its existing lifetime; a
+/// caller needing teardown of ServeElements must restart Recovery rather than
+/// claiming that stopping this process group also tears that server down.
+pub fn start_managed(steps: &[Step]) -> Result<crate::services::ServiceGroup> {
+    let mut group = crate::services::ServiceGroup::default();
+    for step in steps {
+        match step {
+            Step::Start(program) => group.append(crate::services::start_managed(std::slice::from_ref(program.as_ref()), None)?),
+            Step::ServeElements => {
+                let readers = skyward_omapi::start()?;
+                skyward_sys::kmsg(&format!("{} is served, with a reader for each of {} secure elements: {}", skyward_omapi::SERVICE, readers.len(), readers.join(", ")))?;
+            }
+        }
+    }
+    Ok(group)
+}
+
 /// What `steps` are, a line each, as the `keys` command prints them.
 pub fn describe(steps: &[Step]) -> Vec<String> {
     let mut lines = Vec::new();

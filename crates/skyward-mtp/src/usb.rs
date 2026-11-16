@@ -26,7 +26,10 @@ const EP_EVENT: &str = "/dev/usb-ffs/mtp/ep3";
 
 /// How much one transfer of a file moves: two of these take turns, one on
 /// the bus while the other is read from the file or written to it.
-const CHUNK: usize = 1 << 20;
+// MTU3 rejects 1 MiB; the matched queue guard also enforces 0xfffc
+// even when its gen2cp error message prints the larger 0xffffc limit.
+// Use a packet-aligned smaller request without changing AIO cancellation.
+use crate::transport_policy::CHUNK;
 
 /// What a command is read into; one is a single short packet.
 const COMMAND_MAX: usize = 512;
@@ -973,10 +976,7 @@ impl Port {
         loop {
             // The next piece goes on the bus while this one goes to `sink`.
             let next = if more {
-                let asked = match left {
-                    Some(l) => (l as usize).min(CHUNK).next_multiple_of(self.packet).min(CHUNK),
-                    None => CHUNK,
-                };
+                let asked = crate::transport_policy::receive_request(left, self.packet);
                 // Safety: the other buffer stays put until the wait below,
                 // or giving the request up, has seen it end.
                 Some((unsafe { self.start(bufs[1 - cur].as_mut_ptr(), asked, false)? }, asked))

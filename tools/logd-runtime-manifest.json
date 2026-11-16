@@ -1,0 +1,145 @@
+{
+  "files": [
+    {
+      "path": "bin/linker64",
+      "bytes": 2159296,
+      "sha256": "1afe3503fb73ce0acdadcf46fe7e5af70bf063bc288e82f125f8e30bcc129fb8",
+      "mode": "0755"
+    },
+    {
+      "path": "bin/logd",
+      "bytes": 866976,
+      "sha256": "070815d1750bf282e728fcba5bf4de70c06a7f5cc807190276a74c64be2f337e",
+      "mode": "0755"
+    },
+    {
+      "path": "lib64/ld-android.so",
+      "bytes": 34144,
+      "sha256": "d4ba6ea5ef6d67c26188496911ec338a2116e2baf9c58ecfa34244346e43fefe",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libapexsupport.so",
+      "bytes": 236904,
+      "sha256": "4d8b303cc8d664318f79ade1af437ee209de78b06e5b6cd745d7184872ac2c57",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libbase.so",
+      "bytes": 235296,
+      "sha256": "30f24d7866527b839661bc1c23c6be88803ac4f5068f784b38be25c94019e0ab",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libbinder.so",
+      "bytes": 835712,
+      "sha256": "2d6578f74b618ad2c0eb78d1deeb314ef708ce65e3995310de1b7392bc24601e",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libc++.so",
+      "bytes": 1083168,
+      "sha256": "794eb8fafd7be35da3725e9ec0b15189c6f4f2544f5b78afd8a647dde5b69195",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libc.so",
+      "bytes": 1442328,
+      "sha256": "35041db8ee496a67400a01782ac9ef3762d6bc3eaab7c9719ffdba8f2ef4be56",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libcap.so",
+      "bytes": 68104,
+      "sha256": "6f23574929208ccbb179c3a1b10aff737d00c268d45af3c9e9f923aeb3ad985e",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libcgrouprc.so",
+      "bytes": 51640,
+      "sha256": "6892bfeb30d56b7dbaba4864a3973d171697b0081dc24ab3a8eb34851821571c",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libcommon_dcs_service.so",
+      "bytes": 51752,
+      "sha256": "8c3de9e4f6868298fafb4d2c31a730b4165eb13ab87f18c4d435dab5e1e19173",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libcutils.so",
+      "bytes": 318104,
+      "sha256": "736a1bf4ce0a53aa45e1eac5a4dbade71b2a740cb1385bb5148fb390d99e1954",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libdl.so",
+      "bytes": 50760,
+      "sha256": "d882d0bc9db7d5739e234beb979bdda92fa537b4a3f602e1594841be4175f989",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libdl_android.so",
+      "bytes": 34664,
+      "sha256": "e27c494029ba69bca53aef2a59f8e46d0a9333360417856fdcb177c638b30887",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/liblog.so",
+      "bytes": 101992,
+      "sha256": "2c6c8e5ba5a282f158246f0d8a73e60ab92d3293f2c04b27203b8e9037650e97",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libm.so",
+      "bytes": 265568,
+      "sha256": "c2c2ac727c5c69e64052eefe5cf3998457e3d094db7ec839606727d200187107",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libpackagelistparser.so",
+      "bytes": 51576,
+      "sha256": "2f8e152113586a169e931007812010c52d5eb6117a84eec4d6e83ff43cc572ee",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libprocessgroup.so",
+      "bytes": 367400,
+      "sha256": "de409d68264a291118bd50a5ecac25105d55de2188b8af5bb32545e191b8a6dc",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libsysutils.so",
+      "bytes": 84696,
+      "sha256": "f3cf50a4c688be557de7e510335b0e9777015c1c4dcfb48149bd9d46d7fa53b6",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libutils.so",
+      "bytes": 151896,
+      "sha256": "908a2ae88bff2dba426ea9b8a9b29ad22ff43f9eb38b1f42583d43b7b956c59b",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libvndksupport.so",
+      "bytes": 51352,
+      "sha256": "eadb14193b1a4920ad91ad64f60fe81bddff880ea059fcdef3bd17ed59d04949",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/libz.so",
+      "bytes": 133984,
+      "sha256": "4860f08e16e5ba08b397aa1b9140f966e69eb2cfb71ee9c8a2e2ca4bf330779e",
+      "mode": "0644"
+    },
+    {
+      "path": "lib64/packagemanager_aidl-cpp.so",
+      "bytes": 85392,
+      "sha256": "2f6ee1e528a6fdcee419cc51be31552912ed09263c9ecee62aea9487fb445975",
+      "mode": "0644"
+    }
+  ],
+  "total_bytes": 8762704,
+  "target_root": "/skyward/logd-runtime",
+  "no_recovery_library_overwrite": true
+}

@@ -35,6 +35,13 @@ impl Kept {
     /// slot does not hold Skyward, as when it was started without being
     /// flashed.
     pub fn hold(dir: &Path, current: Slot) -> Result<Option<Kept>> {
+        Self::hold_for_layout(dir, current, skyward_config::running_recovery_partition()?)
+    }
+
+    fn hold_for_layout(dir: &Path, current: Slot, layout: skyward_config::RecoveryPartition) -> Result<Option<Kept>> {
+        if layout == skyward_config::RecoveryPartition::VendorBoot {
+            return Ok(None);
+        }
         let (a, image_a) = read(&image::device(dir, PARTITION, Slot::A))?;
         let (b, image_b) = read(&image::device(dir, PARTITION, Slot::B))?;
         let (held, image) = match current {
@@ -56,6 +63,7 @@ impl Kept {
     /// Write this recovery into the recovery partitions of `slots` and read
     /// each back; `progress` hears the bytes so far, of all.
     pub fn write(&self, slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+        skyward_config::running_recovery_partition()?.require_standalone("keeping recovery")?;
         let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(&self.dir, PARTITION, slot)).collect();
         image::flash(&mut Cursor::new(&self.image), self.image.len() as u64, &devices, progress)
     }
@@ -94,6 +102,13 @@ pub fn restore(before: [Held; 2], after: [Held; 2], own: [u8; 32], next: Slot) -
 mod tests {
     use super::*;
     use crate::image::samples::recovery;
+
+    #[test]
+    fn vendor_boot_keeps_nothing_without_accessing_recovery_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Kept::hold_for_layout(dir.path(), Slot::A, skyward_config::RecoveryPartition::VendorBoot).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     const SKYWARD: Held = Held { digest: [1; 32], skyward: true };
     const OWN: [u8; 32] = SKYWARD.digest;

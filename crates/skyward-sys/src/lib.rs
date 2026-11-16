@@ -16,6 +16,8 @@ pub mod uevent;
 pub mod ueventd;
 pub mod usb;
 pub mod worker;
+#[cfg(any(target_os = "android", test))]
+mod suspend_mode;
 
 /// A system property, or `None` when it is unset.
 #[cfg(target_os = "android")]

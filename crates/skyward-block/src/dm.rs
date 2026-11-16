@@ -78,11 +78,23 @@ pub struct Line {
     pub text: String,
 }
 
+/// Read-only observation of a live device-mapper device. A same-name device
+/// is not sufficient evidence that an old detached mapping can be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStatus {
+    pub device: (u32, u32),
+    pub readonly: bool,
+    pub suspended: bool,
+    pub active_table: bool,
+}
+
 // From <linux/dm-ioctl.h>.
 const DM_NAME_LEN: usize = 128;
 const DM_UUID_LEN: usize = 129;
 const DM_MAX_TYPE_NAME: usize = 16;
 const DM_READONLY_FLAG: u32 = 1 << 0;
+const DM_SUSPEND_FLAG: u32 = 1 << 1;
+const DM_ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
 /// Asks DM_TABLE_STATUS for each target's parameters rather than its
 /// status.
 const DM_STATUS_TABLE_FLAG: u32 = 1 << 4;
@@ -319,6 +331,20 @@ mod sys {
         }
     }
 
+    /// Observe a named mapping without creating, suspending or reloading it.
+    pub fn device_status(name: &str) -> Result<Option<DeviceStatus>> {
+        let mut io = DmIoctl::new(name)?;
+        match call(&control()?, DM_DEV_STATUS, io.as_mut_bytes()) {
+            Ok(()) => Ok(Some(DeviceStatus {
+                device: decode(io.dev), readonly: io.flags & DM_READONLY_FLAG != 0,
+                suspended: io.flags & DM_SUSPEND_FLAG != 0,
+                active_table: io.flags & DM_ACTIVE_PRESENT_FLAG != 0,
+            })),
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("inspect device-mapper device {name}")),
+        }
+    }
+
     /// Whether device `name` is read-only.
     pub fn readonly(name: &str) -> Result<bool> {
         let mut io = DmIoctl::new(name)?;
@@ -393,7 +419,7 @@ mod sys {
 
 #[cfg(not(target_os = "android"))]
 mod sys {
-    use super::{Line, Target};
+    use super::{DeviceStatus, Line, Target};
     use anyhow::{bail, Result};
     use std::path::PathBuf;
 
@@ -432,9 +458,13 @@ mod sys {
     pub fn readonly(name: &str) -> Result<bool> {
         bail!("this host has no device-mapper to look up {name}")
     }
+
+    pub fn device_status(name: &str) -> Result<Option<DeviceStatus>> {
+        bail!("this host has no device-mapper to inspect {name}")
+    }
 }
 
-pub use sys::{activate, create, readonly, reload, remove, status, table, table_status, target_version};
+pub use sys::{activate, create, device_status, readonly, reload, remove, status, table, table_status, target_version};
 
 #[cfg(test)]
 mod tests {

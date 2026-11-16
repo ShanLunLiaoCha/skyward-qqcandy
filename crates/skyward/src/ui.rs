@@ -80,102 +80,7 @@ const STORAGE_LOGS: &str = "Skyward/logs";
 const SCREENSHOTS: &str = "DCIM/Screenshots";
 const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
 
-/// The panel backlight under /sys/class/backlight.
-struct Backlight {
-    path: PathBuf,
-    /// The raw level at the top of the slider: the panel's normal maximum.
-    top: u32,
-    /// The raw level last written; at first the one the bootloader left.
-    level: u32,
-}
-
-impl Backlight {
-    fn open() -> Result<Self> {
-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
-            .context("read /sys/class/backlight")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<_>>()?;
-        dirs.sort();
-        // Qualcomm panels expose panel0-backlight; take it when present.
-        let dir = dirs
-            .iter()
-            .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
-            .or(dirs.first())
-            .ok_or_else(|| anyhow!("no backlight device"))?
-            .clone();
-        let read = |name: &str| -> Result<u32> {
-            fs::read_to_string(dir.join(name))
-                .with_context(|| format!("read {}/{name}", dir.display()))?
-                .trim()
-                .parse()
-                .with_context(|| format!("parse {name}"))
-        };
-        let top = normal_max(read("max_brightness")?)?;
-        let level = read("brightness")?;
-        Ok(Backlight { path: dir.join("brightness"), top, level })
-    }
-
-    /// Light the panel at `level` of its normal maximum, or turn it off
-    /// with `None`. The file is written only when the raw level changes.
-    fn show(&mut self, level: Option<f32>) -> Result<()> {
-        let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
-        if raw != self.level {
-            fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
-            eprintln!("backlight {raw}");
-            self.level = raw;
-        }
-        Ok(())
-    }
-}
-
-/// How a panel's node in the device tree may give its normal maximum: the
-/// property holding it, and the one holding the whole range on the same
-/// scale. The 13 Ultra's panel gives both on a finer scale of its own that
-/// spans the same light as the backlight's range; the 17 Ultra's gives them
-/// on the backlight's own scale. The panels of the Xiaomi 13 and 15, of the
-/// 14 and the K80 series and one of the K90's give it only as the level
-/// their factory tests drive the panel to, on the backlight's own scale:
-/// the 13 Ultra's panels give that level as well, and it comes to the same
-/// half of their range as the normal maximum they give.
-const NORMAL_MAX: [(&str, &str); 3] = [
-    ("mi,normal-max-brightness-clone", "mi,max-brightness-clone"),
-    ("mi,max-brightness-normal", "qcom,mdss-dsi-bl-max-level"),
-    ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
-];
-
-/// The raw backlight level, out of `max`, at the panel's normal maximum.
-/// Above it the panel runs in high brightness mode, which the stock system
-/// keeps for strong sunlight and its slider does not reach. The panel the
-/// display driver booted with gives that maximum in the device tree.
-fn normal_max(max: u32) -> Result<u32> {
-    let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
-    // The panel's node, then its configuration after a colon, as in
-    // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
-    // without the colon either.
-    let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
-    let soc = Path::new("/proc/device-tree/soc");
-    let node = fs::read_dir(soc)
-        .with_context(|| format!("read {}", soc.display()))?
-        .map(|e| e.map(|e| e.path().join(name)))
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .find(|p| p.is_dir())
-        .ok_or_else(|| anyhow!("panel {name} is not in the device tree"))?;
-    let cell = |prop: &str| -> Result<u32> {
-        let path = node.join(prop);
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let cell: [u8; 4] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is not one cell", path.display()))?;
-        Ok(u32::from_be_bytes(cell))
-    };
-    let (normal, full) = NORMAL_MAX
-        .iter()
-        .find(|(normal, _)| node.join(normal).exists())
-        .with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
-    let (normal, full) = (cell(normal)?, cell(full)?);
-    ensure!(normal > 0 && normal <= full, "panel {name}: normal maximum {normal} out of {full}");
-    Ok((f64::from(max) * f64::from(normal) / f64::from(full)).round() as u32)
-}
+use crate::backlight::Backlight;
 
 /// Leave recovery for the chosen target.
 fn power(target: Target) -> Result<()> {
@@ -972,7 +877,11 @@ fn read_slots() -> Result<skyward_vab::BootSlots, String> {
         let control = skyward_vab::boot::BootControl::open(&binder, &hardware)?;
         control.slots()
     };
-    read().map_err(|e| format!("{e:#}"))
+    read().map_err(|e| {
+        let why = format!("{e:#}");
+        let _ = skyward_sys::kmsg(&format!("boot slot query failed: {why}"));
+        why
+    })
 }
 
 /// Have the bootloader start `slot` next and give what the boot control
@@ -1001,7 +910,13 @@ fn detach(services: Vec<Service>) -> Detach {
     Box::new(move || {
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
         let mounted = skyward_vab::mounted_partitions(slot)?;
-        let busy = services::pin(&services, &mounted)?;
+        let mut busy = services::pin(&services, &mounted)?;
+        let cfg = DeviceConfig::load(Path::new("/").join(skyward_config::ramdisk::CONFIG))?;
+        if cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot {
+            for point in services::pin_init_owned(&mounted)? {
+                if !busy.contains(&point) { busy.push(point); }
+            }
+        }
         skyward_vab::release_partitions(slot, &busy)
     })
 }
@@ -1088,8 +1003,9 @@ fn job_end(end: filework::End) -> JobEnd {
 /// first of them; asking for nothing, they start at `start`. `programs`
 /// are the phone's own that the recovery keeps running: the
 /// configuration's, and those the phone's partitions name for its keys.
-pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+pub fn run(cfg: &DeviceConfig, programs: &[Service], runtime: crate::runtime::Runtime, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
     let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
+    pages.secure_runtime = runtime;
     pages.begin()?;
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
@@ -1108,7 +1024,11 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
 struct Pages<'a> {
     cfg: &'a DeviceConfig,
     /// The phone's own programs that the recovery keeps running.
-    programs: &'a [Service],
+    programs: Vec<Service>,
+    /// Services prepared when returning from fastboot must stay owned until
+    /// the UI exits, just like the initial recovery run's daemon guard.
+    secure_runtime: crate::runtime::Runtime,
+    secure_quiesced: bool,
     /// What misc asked for as the recovery started.
     request: bcb::Request,
     /// Where each frame shown is written as well.
@@ -1128,6 +1048,7 @@ struct Pages<'a> {
     control: Option<Control>,
     haptics: Option<Haptics>,
     backlight: Backlight,
+    phoenix_ready: bool,
     keeper: Keeper,
     shown_clock: String,
     /// The page shown first, until it has been told it shows.
@@ -1237,8 +1158,15 @@ impl<'a> Pages<'a> {
         let battery = skyward_info::battery_now();
         untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
         let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
+        skyward_sys::kmsg("startup stage: device info read; loading fonts")?;
         let fonts = Fonts::load(font, 0, mono)?;
-        let mut surface = KmsSurface::open("/dev/dri/card0")?;
+        skyward_sys::kmsg("startup stage: fonts loaded; opening DRM card0")?;
+        let resume_mode = match cfg.display.resume_mode {
+            skyward_config::ResumeMode::PreferredThenFastest => skyward_ui::resume_policy::ResumeMode::PreferredThenFastest,
+            skyward_config::ResumeMode::Running => skyward_ui::resume_policy::ResumeMode::Running,
+        };
+        let mut surface = KmsSurface::open_with_resume_policy("/dev/dri/card0", resume_mode)?;
+        skyward_sys::kmsg("startup stage: DRM open returned; opening inputs")?;
         let (w, h) = surface.size();
         // A touch controller that follows the panel wakes as the panel goes
         // from rest to running, and at no other time. The recovery service
@@ -1256,7 +1184,7 @@ impl<'a> Pages<'a> {
         let started = Instant::now();
         let control = Control::open()?;
         let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-        let backlight = Backlight::open()?;
+        let backlight = Backlight::open();
         let first = match &request.work {
             Work::Fastboot => Screen::Fastboot,
             Work::PromptWipeData => Screen::CantStart,
@@ -1275,6 +1203,7 @@ impl<'a> Pages<'a> {
         };
         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
         app.set_screen_corners(cfg.display.corner_radius as f32);
+        app.set_clock_offset_dp(cfg.display.clock_offset_dp as f32);
         // The settings kept from the starts before are back before the first
         // frame, and before file transfer starts with its switch and the time
         // zone. The pages speak the language chosen then, or else the one the
@@ -1316,7 +1245,8 @@ impl<'a> Pages<'a> {
             }
         }
         if fastboot {
-            if let Err(e) = skyward_sys::usb::switch("fastboot", USB_TIMEOUT) {
+            if skyward_sys::prop("sys.usb.state").as_deref() != Some("fastboot")
+                && let Err(e) = skyward_sys::usb::switch("fastboot", USB_TIMEOUT) {
                 skyward_sys::kmsg(&format!("fastbootd has not taken the port: {e:#}"))?;
                 app.report(&format!("{e:#}"), monotonic_ms());
             }
@@ -1340,7 +1270,7 @@ impl<'a> Pages<'a> {
         // partitions in both slots, which a switch writes.
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-        app.state.recovery_partitions = both("recovery")?;
+        app.state.recovery_partitions = cfg.device.recovery_partition == skyward_config::RecoveryPartition::Recovery && both("recovery")?;
         app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
@@ -1367,7 +1297,9 @@ impl<'a> Pages<'a> {
         }
         Ok(Pages {
             cfg,
-            programs,
+            programs: programs.to_vec(),
+            secure_runtime: crate::runtime::Runtime::default(),
+            secure_quiesced: false,
             dump,
             app,
             info,
@@ -1381,6 +1313,7 @@ impl<'a> Pages<'a> {
             control,
             haptics,
             backlight,
+            phoenix_ready: false,
             keeper,
             shown_clock: String::new(),
             arriving: Some(Incoming::Arrived),
@@ -1433,7 +1366,11 @@ impl<'a> Pages<'a> {
     /// pages start from.
     fn begin(&mut self) -> Result<()> {
         let cfg = self.cfg;
-        match &self.request.work {
+        let requested = self.request.work.clone();
+        if cfg.trustonic.is_some() && matches!(&requested,
+            Work::WipeData { .. } | Work::WipeCache { .. } | Work::Sideload { .. } | Work::Rescue
+        ) { ensure!(self.quiesce_secure_runtime(monotonic_ms())?, "security runtime is busy before automatic partition work"); }
+        match &requested {
             Work::WipeData { reformat } => {
                 self.eraser = Some(factory_reset(&mut self.app, self.request.keep_memtag_mode, true, reformat.clone())?);
                 self.erase_leaves = true;
@@ -1470,7 +1407,10 @@ impl<'a> Pages<'a> {
                             self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
                             self.pending = Some(wanted);
                         }
-                        Needs::Nothing | Needs::Cache => self.installer = Some(install_asked(self.programs, &self.app, wanted)?),
+                        Needs::Nothing | Needs::Cache => {
+                            if cfg.trustonic.is_some() { ensure!(self.quiesce_secure_runtime(monotonic_ms())?, "security runtime is busy before update"); }
+                            self.installer = Some(install_asked(&self.programs, &self.app, wanted)?);
+                        }
                     }
                 }
             }
@@ -1535,7 +1475,9 @@ impl<'a> Pages<'a> {
         }
         // The WLAN starts off. Without the bundle of the vendor interface's
         // libraries the supplicant does not start, and the WLAN page says why.
-        if let Some(w) = &cfg.wlan {
+        // Fastboot has no mounted vendor/APEX yet. Create this only when
+        // normal Recovery is prepared, otherwise its library path stays empty.
+        if !self.fastboot && let Some(w) = &cfg.wlan {
             self.app.state.wlan = Some(Wlan::default());
             let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
             let libraries = secure::libraries().unwrap_or_else(|e| {
@@ -1547,6 +1489,26 @@ impl<'a> Pages<'a> {
         self.scanned_at = Instant::now();
         self.app.state.update_server = cfg.update.is_some();
         self.drive_at = Instant::now();
+        if !self.fastboot && matches!(self.request.work, Work::Menu) {
+            self.auto_open_data()?;
+        }
+        Ok(())
+    }
+
+    /// Ordinary credential-free open, never guessing a PIN or starting during
+    /// destructive/automatic BCB work. Password-protected users remain closed.
+    fn auto_open_data(&mut self) -> Result<()> {
+        if !self.cfg.device.auto_open_data || self.fastboot || self.decryptor.is_some()
+            || self.installer.is_some() || self.eraser.is_some() || self.part_worker.is_some() {
+            return Ok(());
+        }
+        if self.cfg.trustonic.is_some() && self.secure_runtime.tee.is_none() {
+            skyward_sys::kmsg("automatic data open deferred: secure runtime preparation failed")?;
+            return Ok(());
+        }
+        if mount::is_mount_point(Path::new("/data"))? { return Ok(()); }
+        self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+        skyward_sys::kmsg("automatic normal-Recovery data open started; no credential guessing")?;
         Ok(())
     }
 
@@ -1688,6 +1650,7 @@ impl<'a> Pages<'a> {
     /// lit, and whether a frame was shown.
     fn show(&mut self, now: u64) -> Result<(bool, bool)> {
         let panel = self.app.panel(now);
+        let waking = panel.is_some() && !self.surface.is_on();
         let mut shown = false;
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
@@ -1695,6 +1658,17 @@ impl<'a> Pages<'a> {
                 let t0 = Instant::now();
                 self.app.compose(&mut self.screen, &self.fonts, &self.info, &self.shown_clock, now);
                 self.surface.present(&self.screen)?;
+                if !self.phoenix_ready {
+                    // The first actual composed page, not KMS's initial black
+                    // buffer, must complete its page flip before readiness.
+                    self.surface.settle()?;
+                    match crate::phoenix::acknowledge_ui_ready(self.cfg) {
+                        Ok(done) => self.phoenix_ready = done,
+                        Err(error) => {
+                            skyward_sys::kmsg(&format!("Phoenix UI-ready notification failed, will retry on a later frame: {error:#}"))?;
+                        }
+                    }
+                }
                 eprintln!("frame {:?} in {} ms", self.app.screen(), t0.elapsed().as_millis());
                 if let Some(path) = self.dump {
                     fs::write(path, &self.screen.data).with_context(|| format!("write {}", path.display()))?;
@@ -1714,16 +1688,20 @@ impl<'a> Pages<'a> {
         // After the frame is on the panel, so a panel coming back on lights
         // with what it should show now, never with what it showed when it
         // went off.
-        if self.backlight.level == 0 && panel.is_some() {
-            self.surface.settle()?;
-        }
-        self.backlight.show(panel)?;
         if panel.is_some() {
-            // Lit, a panel that came on again switches to its fastest
-            // refresh.
-            self.surface.speed_up()?;
+            // MTK may perform a full panel unprepare/prepare on the refresh
+            // change. Keep LED brightness at zero throughout BOTH modesets;
+            // restoring it before speed_up leaves a stale nonzero driver cache.
+            let mode_changed = self.surface.speed_up()?;
+            if waking || mode_changed || self.backlight.level == 0 {
+                self.surface.settle()?;
+                self.backlight.invalidate();
+                eprintln!("display wake at {} ms: preferred/refresh modesets settled; restoring backlight", monotonic_ms());
+            }
+            self.backlight.show(panel)?;
             self.rested_at = None;
         } else if self.surface.is_on() {
+            self.backlight.show(None)?;
             // With the backlight off, the panel rests, and the touch
             // controller following it stops drawing power.
             self.surface.rest()?;
@@ -1855,7 +1833,7 @@ impl<'a> Pages<'a> {
     /// The mount page shows the partitions as they are when it opens and
     /// after each change; why they cannot be read is the page's to say.
     fn mounts(&self) -> Result<Vec<skyward_ui::app::MountRow>, String> {
-        read_mounts(self.programs).map_err(|e| format!("{e:#}"))
+        read_mounts(&self.programs).map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -2197,9 +2175,9 @@ impl Pages<'_> {
             }
         }
         let wlan_on = self.app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
-        if self.app.screen() == Screen::Wlan && wlan_on && self.scanned_at.elapsed() >= SCAN_EVERY {
+        if self.app.screen() == Screen::Wlan && crate::runtime_policy::auto_scan_ready(wlan_on, self.wlan.is_some()) && self.scanned_at.elapsed() >= SCAN_EVERY {
             self.scanned_at = Instant::now();
-            wlan_worker(&self.wlan)?.send(wlan::Command::Scan);
+            if let Some(worker) = &self.wlan { worker.send(wlan::Command::Scan); }
         }
         Ok(())
     }
@@ -2373,7 +2351,10 @@ impl Pages<'_> {
                     self.app.asked_locked(user, now);
                     self.pending = Some(wanted);
                 }
-                _ => self.installer = Some(install_asked(self.programs, &self.app, wanted)?),
+                _ => {
+                    if self.cfg.trustonic.is_some() { ensure!(self.quiesce_secure_runtime(now)?, "security runtime busy before decrypted update package"); }
+                    self.installer = Some(install_asked(&self.programs, &self.app, wanted)?);
+                }
             }
         }
         Ok(())
@@ -2464,9 +2445,54 @@ impl Pages<'_> {
             // after it.
             let mut queue = VecDeque::from(effects);
             while let Some(fx) = queue.pop_front() {
-                eprintln!("effect {fx:?}");
+                match &fx {
+                    Effect::Unlock { .. } => eprintln!("effect Unlock (credential redacted)"),
+                    Effect::JoinWlan { .. } => eprintln!("effect JoinWlan (credentials redacted)"),
+                    Effect::TermInput(_) => eprintln!("effect TermInput (input redacted)"),
+                    _ => eprintln!("effect {fx:?}"),
+                }
                 queue.extend(self.effect(fx, now)?);
             }
+        }
+        Ok(())
+    }
+
+    /// Quiesce only owned security processes before a partition transaction.
+    /// Keep an already-open /data mounted: an installer may still need to read
+    /// its package from it. The existing wipe/restore worker owns unmounting.
+    fn quiesce_secure_runtime(&mut self, now: u64) -> Result<bool> {
+        if self.secure_quiesced { return Ok(true); }
+        if self.decryptor.is_some() || self.backuper.is_some() || self.worker.is_some() || self.relabeler.is_some() {
+            self.app.report("Wait for data/file work to finish before changing partitions", now);
+            return Ok(false);
+        }
+        if !withhold(&mut self.transfer, &mut self.app, now)? { return Ok(false); }
+        // A vendor-backed supplicant must release firmware/library paths before
+        // an installer detaches vendor/odm. Worker Drop requests Off and joins.
+        if let Some(wlan) = self.wlan.take() { drop(wlan); }
+        if self.cfg.wlan.is_some() { self.app.set_wlan(Wlan::default()); }
+        if let Err(error) = self.secure_runtime.stop() {
+            self.app.report(&format!("Security services could not stop safely: {error:#}"), now);
+            return Ok(false);
+        }
+        self.secure_quiesced = true;
+        skyward_sys::kmsg("owned KeyMint/Gatekeeper services and TEE stopped before partition work; no restart loop remains")?;
+        Ok(true)
+    }
+
+    fn restore_secure_runtime(&mut self) -> Result<()> {
+        ensure!(self.eraser.is_none() && self.backuper.is_none() && self.part_worker.is_none() && self.installer.is_none(), "partition work must finish before security services restart");
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let (programs, runtime) = crate::prepare(self.cfg, slot)?;
+        runtime.services.check().context("restored service supervisors are not healthy")?;
+        ensure!(self.cfg.trustonic.is_none() || runtime.tee.is_some(), "secure service preparation failed; see recovery log; services remain stopped and may be retried");
+        self.programs = self.cfg.services.iter().cloned().chain(programs).collect();
+        self.secure_runtime = runtime;
+        self.secure_quiesced = false;
+        if self.wlan.is_none() && let Some(config) = &self.cfg.wlan {
+            let modules = self.cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            self.wlan = Some(wlan::Worker::start(config.clone(), modules, secure::libraries()?, self.servers.clone())?);
+            self.app.state.wlan = Some(Wlan::default());
         }
         Ok(())
     }
@@ -2474,6 +2500,26 @@ impl Pages<'_> {
     /// Do what a page asks for, and give what the pages ask for in answer
     /// to it.
     fn effect(&mut self, fx: Effect, now: u64) -> Result<Vec<Effect>> {
+        if self.cfg.trustonic.is_some() && matches!(&fx,
+            Effect::FactoryReset | Effect::Wipe(_) | Effect::Install |
+            Effect::Sideload | Effect::InstallFile(..) | Effect::InstallPath(_) |
+            Effect::Flash { .. } | Effect::SwitchSystem(_) |
+            Effect::RemoveSystem | Effect::InstallSystem { .. } |
+            Effect::Filesystem { action: FsAction::Remake(_), .. } | Effect::Restore { .. } |
+            Effect::Unmount(_) | Effect::Merge | Effect::UpdateSkyward(_)
+        ) && !self.quiesce_secure_runtime(now)? {
+            return Ok(Vec::new());
+        }
+        if crate::runtime_policy::needs_restored_services(&fx) && self.secure_quiesced {
+            if let Err(error) = self.restore_secure_runtime() {
+                self.app.report(&format!("Security services could not restart: {error:#}"), now);
+                return Ok(Vec::new());
+            }
+        }
+        if crate::runtime_policy::needs_wlan_worker(&fx) && self.wlan.is_none() {
+            self.app.report("Wi-Fi is stopped for partition work; finish the operation and turn Wi-Fi on again", now);
+            return Ok(Vec::new());
+        }
         let cfg = self.cfg;
         match fx {
             // Leaving is the user's answer to whatever the request
@@ -2553,8 +2599,11 @@ impl Pages<'_> {
             // The decrypt page shows meanwhile that the work is
             // under way, and takes nothing more until it is done.
             Effect::OpenData => {
-                ensure!(self.decryptor.is_none(), "the data partition is being opened already");
-                self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                // Opening the decrypt page while automatic open is running
+                // must reuse the job, not abort the Recovery event loop.
+                if self.decryptor.is_none() {
+                    self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                }
             }
             Effect::Unlock { user, code } => {
                 ensure!(self.decryptor.is_none(), "the data partition is being opened already");
@@ -2973,13 +3022,29 @@ impl Pages<'_> {
     /// port goes through "none"; then the slot's partitions come up as at
     /// boot.
     fn enter_recovery(&mut self) -> Result<()> {
-        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
+        skyward_sys::usb::set("none", USB_TIMEOUT)?;
+        skyward_sys::wait_prop("init.svc.fastbootd", "stopped", USB_TIMEOUT)?;
+        crate::boot_services::release_for_recovery(self.cfg)?;
+        skyward_sys::usb::set(skyward_sys::usb::resting(), USB_TIMEOUT)?;
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-        crate::prepare(self.cfg, slot)?;
+        let (programs, daemon) = crate::prepare(self.cfg, slot)?;
+        self.programs = self.cfg.services.iter().cloned().chain(programs).collect();
+        self.secure_runtime = daemon;
+        self.secure_quiesced = false;
         self.read_at = Instant::now();
         read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
         self.fastboot = false;
+        // Recreate normal-mode workers after mounted vendor/APEX preparation,
+        // not with the fastboot session's absent/stale library environment.
+        if let Some(previous) = self.wlan.take() { drop(previous); }
+        if let Some(config) = &self.cfg.wlan {
+            let modules = self.cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            self.wlan = Some(wlan::Worker::start(config.clone(), modules, secure::libraries()?, self.servers.clone())?);
+            self.app.set_wlan(Wlan::default());
+        }
+        self.scanned_at = Instant::now();
         self.app.enter_recovery();
+        self.auto_open_data()?;
         if let Some(w) = self.systems_worker.as_mut() {
             w.send(systems::Task::Resume);
         }

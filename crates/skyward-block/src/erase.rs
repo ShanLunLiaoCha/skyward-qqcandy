@@ -63,13 +63,51 @@ pub fn make(device: &Path, filesystem: &str, extras: &[String], casefold: bool) 
     let (program, mut args) = command(device, filesystem, extras, casefold, page_size())?;
     args.push(tools::path(device)?);
     if let Some(length) = length(extras, || crate::size_bytes(device))? {
-        // mke2fs counts it in its blocks, Android's make_f2fs in sectors it
-        // takes as just as large.
         args.push((length / BLOCK).to_string());
     }
     let tool = tools::find(program)?;
     let ran = tool.run(&args)?;
     ensure!(ran.status == 0, "{} ended with {}: {}", tool.describe(&args), ran.status, ran.said.trim());
+    Ok(())
+}
+
+/// Resolved formatter and arguments. Preparing never executes it or writes to
+/// the device; factory reset prepares every partition before destroying keys.
+#[derive(Debug)]
+pub struct PreparedFormat { tool: tools::Tool, args: Vec<String> }
+impl PreparedFormat {
+    pub fn run(&self) -> Result<()> {
+        let ran = self.tool.run(&self.args)?;
+        ensure!(ran.status == 0, "{} ended with {}: {}", self.tool.describe(&self.args), ran.status, ran.said.trim());
+        Ok(())
+    }
+}
+
+/// Validate filesystem/options, resolved tool and size without formatting.
+/// This validates supported arguments in our formatter contract, not whether
+/// a particular vendor executable will succeed when actually invoked.
+pub fn prepared(device: &Path, filesystem: &str, extras: &[String], casefold: bool) -> Result<PreparedFormat> {
+    use std::os::unix::fs::PermissionsExt;
+    let (program, mut args) = command(device, filesystem, extras, casefold, page_size())?;
+    args.push(tools::path(device)?);
+    if let Some(length) = length(extras, || crate::size_bytes(device))? {
+        // mke2fs counts it in its blocks, Android's make_f2fs in sectors it
+        // takes as just as large.
+        args.push((length / BLOCK).to_string());
+    }
+    let tool = tools::find(program)?;
+    let metadata = std::fs::metadata(&tool.program).context("stat filesystem formatter")?;
+    ensure!(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0, "filesystem formatter is not executable: {}", tool.program.display());
+    let size = crate::size_bytes(device)?;
+    ensure!(size >= BLOCK, "partition too small to format");
+    if let Some(bytes) = length(extras, || Ok(size))? {
+        validate_format_length(bytes, size)?;
+    }
+    Ok(PreparedFormat { tool, args })
+}
+
+fn validate_format_length(bytes: u64, partition_size: u64) -> Result<()> {
+    ensure!(bytes >= BLOCK && bytes <= partition_size && bytes % BLOCK == 0, "requested filesystem length is outside the partition or not block aligned");
     Ok(())
 }
 
@@ -160,6 +198,15 @@ mod tests {
 
     fn extras(list: &[&str]) -> Vec<String> {
         list.iter().map(|e| e.to_string()).collect()
+    }
+
+    #[test]
+    fn reset_preflight_rejects_invalid_format_lengths_without_running_tools() {
+        for bytes in [0, 1, 4095, 4097, 12288] { assert!(validate_format_length(bytes, 8192).is_err()); }
+        assert!(validate_format_length(4096, 8192).is_ok());
+        assert!(validate_format_length(8192, 8192).is_ok());
+        assert!(command(Path::new("/not/a/device"), "unknownfs", &[], false, 4096).is_err());
+        assert!(command(Path::new("/not/a/device"), "ext4", &extras(&["logicalblk=3", "eraseblk=4096"]), false, 4096).is_err());
     }
 
     #[test]

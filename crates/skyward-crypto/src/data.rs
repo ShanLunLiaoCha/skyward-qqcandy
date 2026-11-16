@@ -36,7 +36,9 @@ const OWNER: u32 = 0;
 /// storage hardware the form of it that lasts until the phone is started
 /// again.
 pub fn storage_key(service: &KeyMint, entry: &Entry, encryption: &Encryption) -> Result<Vec<u8>> {
-    hardware_key(service, &key_dir(entry)?, encryption.wrapped)
+    let key = hardware_key(service, &key_dir(entry)?, encryption.wrapped)?;
+    encryption.validate_key(&key)?;
+    Ok(key)
 }
 
 /// The key a directory holds, in the form the storage hardware takes for
@@ -97,6 +99,14 @@ fn open(service: &KeyMint) -> Result<Opened> {
 fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
     let entries = skyward_block::fstab::read(MOUNT)?;
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
+    anyhow::ensure!(entry.extra("fileencryption").is_some_and(|value| !value.is_empty()), "the installed data fstab does not describe FBE; refusing metadata mapping");
+    key_dir(entry)?;
+    let slot = skyward_vab::current_slot()?.context("no active slot to read installed metadata encryption properties")?;
+    let properties = skyward_info::installed_props(slot)?;
+    crate::encryption::modern_format(
+        properties.get("ro.crypto.dm_default_key.options_format.version").map(String::as_str),
+        properties.get("ro.product.first_api_level").map(String::as_str),
+    )?;
     let encryption = Encryption::of(entry)?;
     let device = skyward_block::fstab::device(entry)?;
     let key = storage_key(service, entry, &encryption)?;

@@ -7,6 +7,7 @@ pub mod format;
 pub mod responder;
 pub mod store;
 pub mod time;
+pub mod transport_policy;
 
 #[cfg(target_os = "android")]
 mod service;

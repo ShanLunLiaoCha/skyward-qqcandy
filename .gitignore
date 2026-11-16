@@ -15,3 +15,20 @@ NOTES.md
 TODO.md
 *.draft.md
 notes/
+
+# Local build, firmware, validation and sensitive device artifacts
+/out/
+/stock/
+/validation/
+/symbols/
+/research/
+__pycache__/
+*.py[cod]
+*.log
+*.debug
+/adbkey
+/adbkey.pub
+/adb_keys
+/wifi_profiles.toml
+/FIX*-USERDEBUG*.md
+/SOURCE-SHA256SUMS.txt

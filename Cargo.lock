@@ -2465,6 +2465,9 @@ dependencies = [
  "sha2 0.10.9",
  "skyward-binder",
  "skyward-block",
+ "skyward-info",
+ "skyward-sys",
+ "skyward-vab",
 ]
 
 [[package]]

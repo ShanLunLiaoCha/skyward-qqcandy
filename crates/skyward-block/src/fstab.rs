@@ -51,18 +51,59 @@ pub fn entries(text: &str) -> Vec<Entry> {
     out
 }
 
-/// Every entry of the phone's own table, read from wherever the table is.
-fn table() -> Result<Vec<Entry>> {
-    let mut out = Vec::new();
-    for file in FILES {
-        let text = match std::fs::read_to_string(file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {file}")),
-        };
-        out.extend(entries(&text));
+/// Select only a validated platform's table. Never glob fstab.*: generic
+/// eMMC or swap tables shipped for other hardware may describe different keys.
+fn candidates(platform: Option<&str>) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    if let Some(platform) = platform.filter(|name| !name.is_empty() && *name != "unknown") {
+        anyhow::ensure!(platform.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')), "invalid fstab platform name");
+        for base in ["/vendor/etc", "/odm/etc"] {
+            paths.push(format!("{base}/fstab.{platform}"));
+        }
     }
-    Ok(out)
+    Ok(paths)
+}
+
+#[cfg(target_os = "android")]
+fn platform() -> Option<String> {
+    for name in [c"ro.boot.hardware", c"ro.hardware", c"ro.board.platform"] {
+        let mut value = [0 as libc::c_char; libc::PROP_VALUE_MAX as usize];
+        let count = unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+        if count > 0 {
+            let value = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().into_owned();
+            if value != "unknown" { return Some(value); }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "android"))]
+fn platform() -> Option<String> { None }
+
+fn table_from(platform: Option<&str>, read: impl Fn(&str) -> std::io::Result<String>) -> Result<Vec<Entry>> {
+    let load = |files: &[String]| -> Result<(bool, Vec<Entry>)> {
+        let mut found = false;
+        let mut rows = Vec::new();
+        for file in files {
+            match read(file) {
+                Ok(text) => { found = true; rows.extend(entries(&text)); }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e).with_context(|| format!("read {file}")),
+            }
+        }
+        Ok((found, rows))
+    };
+    let (found, rows) = load(&candidates(platform)?)?;
+    if found { return Ok(rows); }
+    // Legacy Qualcomm callers are unchanged when their platform table isn't
+    // present. Never combine a known MTK table with an unrelated qcom table.
+    let files: Vec<String> = FILES.iter().map(|p| p.to_string()).collect();
+    Ok(load(&files)?.1)
+}
+
+/// Installed vendor/odm data tables, not the potentially older recovery fstab.
+fn table() -> Result<Vec<Entry>> {
+    table_from(platform().as_deref(), |file| std::fs::read_to_string(file))
 }
 
 /// What the phone's own table says about `mount_point`.
@@ -117,6 +158,26 @@ pub fn mount(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtk_table_is_selected_without_merging_unrelated_qcom_tables() {
+        let selected = table_from(Some("mt6895"), |path| match path {
+            "/vendor/etc/fstab.mt6895" => Ok("/dev/block/by-name/userdata /data f2fs inlinecrypt wait,keydirectory=/metadata/vold/metadata_encryption\n".into()),
+            "/vendor/etc/fstab.qcom" => panic!("must not fall back when MTK table exists"),
+            _ => Err(std::io::ErrorKind::NotFound.into()),
+        }).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].extra("keydirectory"), Some("/metadata/vold/metadata_encryption"));
+    }
+
+    #[test]
+    fn platform_paths_fail_closed_and_legacy_qcom_remains_readable() {
+        assert!(candidates(Some("../etc/passwd")).is_err());
+        assert!(candidates(Some("mt6895/evil")).is_err());
+        let rows = table_from(None, |path| if path == FILES[0] { Ok(TABLE.into()) } else { Err(std::io::ErrorKind::NotFound.into()) }).unwrap();
+        assert!(!rows.is_empty());
+        assert!(table_from(Some("mt6895"), |_| Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+    }
 
     const TABLE: &str = "\
 # a comment

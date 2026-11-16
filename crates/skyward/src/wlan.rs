@@ -106,7 +106,7 @@ impl Worker {
         let (inbox, asked) = worker::telling().context("make the WLAN thread's inbox")?;
         let back = inbox.clone();
         let worker = worker::Worker::start("wlan", move |tell| {
-            let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, back, tell };
+            let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, pending_profile: None, auto_remembered: true, back, tell };
             s.run(&asked);
         })?;
         Ok(Worker { inbox, worker })
@@ -200,6 +200,8 @@ struct Station {
     servers: Servers,
     state: Wlan,
     running: Option<Running>,
+    pending_profile: Option<crate::wifi_profiles::Profile>,
+    auto_remembered: bool,
     /// What a thread asking for an address, or looking how far the
     /// network reaches, answers to: the thread's own inbox.
     back: Teller<Inbox>,
@@ -259,14 +261,24 @@ impl Station {
             }
             Command::Join { ssid, name, security, password } => {
                 self.unaddress();
+                self.auto_remembered = false;
+                self.pending_profile = security_code(security).map(|code| crate::wifi_profiles::Profile { ssid: ssid.clone(), security: code, password: password.clone() });
                 let mut joined = Joined { ssid, name, security, stage: Stage::Joining };
                 if let Err(e) = self.join(&joined, &password) {
                     let _ = skyward_sys::kmsg(&format!("joining {} failed: {e:#}", joined.name));
                     joined.stage = Stage::Failed;
+                    self.pending_profile = None;
                 }
                 self.state.joined = Some(joined);
             }
             Command::Leave => {
+                self.auto_remembered = false;
+                self.pending_profile = None;
+                if let Some(joined) = &self.state.joined && let Some(code) = security_code(joined.security) {
+                    if crate::wifi_profiles::forget(&joined.ssid, code).is_err() {
+                        let _=skyward_sys::kmsg("WLAN saved profile could not be forgotten; data may be unavailable");
+                    }
+                }
                 self.unaddress();
                 if let Some(r) = &self.running
                     && let Err(e) = r.control.order("REMOVE_NETWORK all")
@@ -282,6 +294,7 @@ impl Station {
         if self.running.is_some() {
             return;
         }
+        self.auto_remembered = true;
         self.state.power = Power::Starting;
         self.tell.tell(Report::Wlan(self.state.clone()));
         match self.start() {
@@ -298,7 +311,16 @@ impl Station {
     }
 
     fn start(&self) -> Result<Running> {
-        bring_up(&self.cfg, &self.modules)?;
+        let result = self.start_inner();
+        if result.is_err() {
+            let _ = iface::set_up(&self.cfg.interface, false);
+            let _ = set_power(&self.cfg, false);
+        }
+        result
+    }
+
+    fn start_inner(&self) -> Result<Running> {
+        bring_up(&self.cfg, &self.modules, self.libraries.as_deref())?;
         let mut child = start_supplicant(&self.cfg, self.libraries.as_deref())?;
         let socket = Path::new(HOME).join("sockets").join(&self.cfg.interface);
         let connected = (|| -> Result<(Control, Control)> {
@@ -315,7 +337,13 @@ impl Station {
                 return Err(e);
             }
         };
-        let mac = iface::hardware_address(&self.cfg.interface)?;
+        let mac = match iface::hardware_address(&self.cfg.interface) {
+            Ok(mac) => mac,
+            Err(error) => {
+                end(&mut child, Some(&control));
+                return Err(error);
+            }
+        };
         Ok(Running {
             child,
             control,
@@ -333,12 +361,16 @@ impl Station {
     }
 
     fn off(&mut self) {
+        self.pending_profile = None;
         self.unaddress();
         if let Some(mut r) = self.running.take() {
             end(&mut r.child, Some(&r.control));
         }
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        }
+        if let Err(error) = set_power(&self.cfg, false) {
+            let _ = skyward_sys::kmsg(&format!("WLAN power-off failed: {error:#}"));
         }
         self.state = Wlan::default();
     }
@@ -397,6 +429,18 @@ impl Station {
         }
         self.state.networks = wlan::networks(&found);
         r.found = found;
+        // Only after the user turns WLAN on. A later explicit scan can find
+        // profiles after /data was opened while WLAN was already enabled.
+        if self.auto_remembered && self.state.joined.is_none() {
+            if let Ok(profiles) = crate::wifi_profiles::load() {
+                if let Some(profile) = profiles.into_iter().find(|p| r.found.iter().any(|b| b.ssid == p.ssid && security_code(b.security) == Some(p.security))) {
+                    if let Some(security) = security_from_code(profile.security) {
+                        let name=String::from_utf8_lossy(&profile.ssid).into_owned();
+                        self.command(Command::Join { ssid: profile.ssid, name, security, password: profile.password });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -407,6 +451,7 @@ impl Station {
             Next::Address => self.ask_address(),
             Next::Unaddress => self.unaddress(),
             Next::Forget => {
+                self.pending_profile = None;
                 if let Some(r) = &self.running
                     && let Err(e) = r.control.order("REMOVE_NETWORK all")
                 {
@@ -498,6 +543,12 @@ impl Station {
         }
         if let Some(dns) = look {
             self.probe(dns);
+        }
+        // DHCP completed: do not remember wrong credentials or mere attempts.
+        if let Some(profile) = self.pending_profile.take() {
+            if crate::wifi_profiles::remember(profile).is_err() {
+                let _=skyward_sys::kmsg("WLAN connected temporarily; credentials could not be remembered on decrypted data");
+            }
         }
         self.poll_link();
     }
@@ -622,18 +673,43 @@ impl Station {
 
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
-fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+fn bring_up(cfg: &Config, modules: &[PathBuf], libraries: Option<&Path>) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
-        for file in &cfg.firmware {
-            place(file)?;
+        if cfg.nvram.is_some() && !crate::wifi_calibration::loaded() {
+            for module in &cfg.calibration_modules {
+                let name=module.replace('-',"_");
+                ensure!(!Path::new("/sys/module").join(name).exists(), "joint calibration participant {module} was already loaded before RAM calibration; restart Recovery cleanly, do not reset calibration");
+            }
+        }
+        // Connectivity bootstrap can request firmware too, before WLAN loads.
+        for file in &cfg.firmware { place(file)?; }
+        if let Some(bootstrap) = &cfg.bootstrap {
+            for path in skyward_modules::load(modules, &bootstrap.modules)? {
+                skyward_sys::kmsg(&format!("loaded WLAN bootstrap {}", path.display()))?;
+            }
+            if skyward_sys::prop(&bootstrap.ready_property).as_deref() != Some(bootstrap.ready_value.as_str()) {
+                run_bootstrap(bootstrap, libraries)?;
+            }
         }
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
+        if let Some(nvram) = &cfg.nvram {
+            if !crate::wifi_calibration::loaded() {
+                skyward_sys::ueventd::apply()?;
+                crate::wifi_calibration::load(nvram)?;
+            }
+        }
+        if !cfg.calibration_modules.is_empty() {
+            for path in skyward_modules::load(modules, &cfg.calibration_modules)? {
+                skyward_sys::kmsg(&format!("loaded joint-calibration participant {}", path.display()))?;
+            }
+        }
         for w in &cfg.writes {
             fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
         }
+        set_power(cfg, true)?;
         let until = Instant::now() + INTERFACE_WAIT;
         while !net.exists() {
             ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
@@ -641,6 +717,63 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         }
     }
     iface::set_up(&cfg.interface, true)
+}
+
+fn run_bootstrap(cfg: &skyward_config::WlanBootstrap, libraries: Option<&Path>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut paths = cfg.libraries.clone();
+    if let Some(dir) = libraries { paths.push(dir.to_string_lossy().into_owned()); }
+    let mut command = Process::new(&cfg.program);
+    command.current_dir("/").env("LD_LIBRARY_PATH", paths.join(":"))
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+    unsafe { command.pre_exec(|| {
+        let groups: [libc::gid_t;1]=[1000];
+        if libc::setgroups(groups.len(),groups.as_ptr())!=0 || libc::setresgid(1000,1000,1000)!=0 || libc::setresuid(1000,1000,1000)!=0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }); }
+    let mut child = command.spawn().with_context(|| format!("start WLAN bootstrap {}", cfg.program))?;
+    // The stock loader retries a missing conninfra node indefinitely. Recovery
+    // owns this child and bounds the whole bootstrap, rather than hanging UI.
+    let until = Instant::now() + INTERFACE_WAIT;
+    loop {
+        // Recovery's ueventd may have parsed vendor rules before vendor was
+        // mounted. Apply the installed stock ownership to nodes just created
+        // by conninfra so the original system-UID loader can open them.
+        if let Err(error) = skyward_sys::ueventd::apply() {
+            let _=child.kill();let _=child.wait();
+            return Err(error).context("apply original permissions to WLAN bootstrap nodes");
+        }
+        if let Some(status) = child.try_wait()? {
+            ensure!(status.success(), "WLAN bootstrap ended: {status}");
+            ensure!(skyward_sys::prop(&cfg.ready_property).as_deref() == Some(cfg.ready_value.as_str()), "WLAN bootstrap exited without {}={}", cfg.ready_property, cfg.ready_value);
+            return Ok(());
+        }
+        if Instant::now() >= until {
+            let _=child.kill();let _=child.wait();
+            bail!("WLAN bootstrap did not complete in {} seconds", INTERFACE_WAIT.as_secs());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn set_power(cfg: &Config, on: bool) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::FileTypeExt;
+    let Some(power) = &cfg.power else { return Ok(()) };
+    let path = Path::new(&power.path);
+    let until = Instant::now()+INTERFACE_WAIT;
+    while !path.exists() {
+        if !on { return Ok(()) }
+        ensure!(Instant::now()<until, "WLAN power node {} did not appear", path.display());
+        thread::sleep(Duration::from_millis(50));
+    }
+    skyward_sys::ueventd::apply()?;
+    ensure!(fs::symlink_metadata(path)?.file_type().is_char_device(), "WLAN power path is not a character device: {}", path.display());
+    let mut file=fs::OpenOptions::new().write(true).open(path).with_context(|| format!("open WLAN power {}", path.display()))?;
+    file.write_all(if on { power.on.as_bytes() } else { power.off.as_bytes() })
+        .with_context(|| format!("WLAN power {} command failed", if on { "on" } else { "off" }))
 }
 
 /// Put a file the driver asks for where the firmware loader looks.
@@ -673,7 +806,8 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     let settings = home.join("wpa_supplicant.conf");
     fs::write(&settings, format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display()))
         .with_context(|| format!("write {}", settings.display()))?;
-    fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).with_context(|| format!("open {} to the supplicant", settings.display()))?;
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).with_context(|| format!("restrict {} to the supplicant", settings.display()))?;
+    std::os::unix::fs::chown(&settings, Some(WIFI), Some(WIFI))?;
     let socket = sockets.join(&cfg.interface);
     // One an earlier run left would answer nothing.
     if socket.exists() {
@@ -690,7 +824,7 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if skyward_sys::prop("ro.build.type").as_deref() == Some("userdebug") { Stdio::inherit() } else { Stdio::null() })
         .spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;
@@ -721,4 +855,12 @@ fn end(child: &mut Child, control: Option<&Control>) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// Persist explicit stable protocol tags, never Rust enum discriminants.
+fn security_code(value: Security) -> Option<u8> {
+    Some(match value { Security::Open=>0,Security::Owe=>1,Security::Psk=>2,Security::Sae=>3,Security::PskSae=>4,_=>return None })
+}
+fn security_from_code(value:u8)->Option<Security> {
+    Some(match value {0=>Security::Open,1=>Security::Owe,2=>Security::Psk,3=>Security::Sae,4=>Security::PskSae,_=>return None})
 }

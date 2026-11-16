@@ -86,6 +86,224 @@ pub fn start(programs: &[Started], libraries: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+// BEGIN OWNED_SUPERVISOR_CORE
+/// A cancellable supervisor owns only children it spawned. No PID/path adoption.
+pub mod owned_supervisor {
+    use std::process::Child;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+    use anyhow::{Context, Result};
+
+    #[derive(Default)]
+    struct Stop { cancelled: Mutex<bool>, changed: Condvar, no_restart: std::sync::atomic::AtomicBool }
+    impl Stop {
+        fn cancelled(&self) -> bool { *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) }
+        fn cancel(&self) {
+            *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.changed.notify_all();
+        }
+        fn wait(&self, duration: Duration) -> bool {
+            let guard = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard { return true; }
+            let (guard, _) = self.changed.wait_timeout_while(guard, duration, |stopped| !*stopped)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard
+        }
+    }
+
+    pub struct OwnedSupervisor { stop: Arc<Stop>, worker: Option<JoinHandle<Result<()>>> }
+    impl OwnedSupervisor {
+        pub fn start(name: String, child: Child, mut spawn: impl FnMut() -> Result<Child> + Send + 'static) -> Result<Self> {
+            let stop = Arc::new(Stop::default());
+            // If thread creation fails the caller still owns the initial child
+            // via this slot and reaps it. Once handed over, only the worker owns it.
+            let initial = Arc::new(Mutex::new(Some(child)));
+            let hand = initial.clone(); let token = stop.clone();
+            let worker = thread::Builder::new().name(name.clone()).spawn(move || {
+                let mut child = hand.lock().unwrap_or_else(|e| e.into_inner()).take().expect("owned initial child");
+                loop {
+                    let started = Instant::now();
+                    loop {
+                        if token.cancelled() { return stop_child(&mut child); }
+                        if let Some(status) = child.try_wait().context("inspect owned service child")? {
+                            eprintln!("managed service {name} pid {} exited: {status}", child.id());
+                            break;
+                        }
+                        if token.wait(Duration::from_millis(50)) { return stop_child(&mut child); }
+                    }
+                    if token.no_restart.load(std::sync::atomic::Ordering::Acquire) { return Ok(()); }
+                    let pause = Duration::from_secs(1).saturating_sub(started.elapsed());
+                    if token.wait(pause) { return Ok(()); }
+                    loop {
+                        if token.cancelled() || token.no_restart.load(std::sync::atomic::Ordering::Acquire) { return Ok(()); }
+                        match spawn() {
+                            Ok(next) => { child = next; break; }
+                            Err(error) => eprintln!("managed service {name} restart failed: {error:#}"),
+                        }
+                        if token.wait(Duration::from_secs(1)) { return Ok(()); }
+                    }
+                }
+            });
+            match worker {
+                Ok(worker) => Ok(Self { stop, worker: Some(worker) }),
+                Err(error) => {
+                    if let Some(mut child) = initial.lock().unwrap_or_else(|e| e.into_inner()).take() { stop_child(&mut child)?; }
+                    Err(error).context("start owned service supervisor")
+                }
+            }
+        }
+        pub fn pause_restarts(&self) { self.stop.no_restart.store(true, std::sync::atomic::Ordering::Release); }
+        pub fn cancel(&self) { self.pause_restarts(); self.stop.cancel(); }
+        pub fn check(&self) -> Result<()> {
+            anyhow::ensure!(!self.stop.cancelled(), "owned service supervisor has been cancelled");
+            anyhow::ensure!(self.worker.as_ref().is_some_and(|worker| !worker.is_finished()), "owned service supervisor is no longer running");
+            Ok(())
+        }
+        pub fn join(&mut self) -> Result<()> {
+            self.cancel();
+            if let Some(worker) = self.worker.take() {
+                worker.join().map_err(|_| anyhow::anyhow!("owned service supervisor panicked"))??;
+            }
+            Ok(())
+        }
+    }
+    impl Drop for OwnedSupervisor {
+        fn drop(&mut self) { if let Err(error) = self.join() { eprintln!("owned service shutdown failed: {error:#}"); } }
+    }
+
+    fn stop_child(child: &mut Child) -> Result<()> {
+        // Once try_wait reaps it, never signal that numeric PID again.
+        if child.try_wait().context("inspect child before termination")?.is_some() { return Ok(()); }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+            let pid = i32::try_from(child.id()).context("owned service PID out of range")?;
+            // TERM is a grace request, not a promise to flush TEE or HAL state.
+            let _ = unsafe { kill(pid, 15) };
+            let until = Instant::now() + Duration::from_secs(1);
+            loop {
+                if child.try_wait().context("wait for owned service TERM")?.is_some() { return Ok(()); }
+                if Instant::now() >= until { break; }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        match child.kill() {
+            Ok(()) => {},
+            Err(error) => {
+                if child.try_wait()?.is_some() { return Ok(()); }
+                return Err(error).context("kill unresponsive owned service");
+            }
+        }
+        child.wait().context("reap owned service child")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        fn sleep_child() -> Child { Command::new("sh").args(["-c", "exec sleep 60"]).spawn().unwrap() }
+        #[test]
+        fn cancellation_reaps_owned_child_without_restart_or_harming_other_child() {
+            let child = sleep_child(); let pid = child.id(); let mut unrelated = sleep_child();
+            let restarts = Arc::new(AtomicUsize::new(0)); let count = restarts.clone();
+            let mut service = OwnedSupervisor::start("owned-test".into(), child, move || { count.fetch_add(1, Ordering::SeqCst); Ok(sleep_child()) }).unwrap();
+            service.join().unwrap(); service.join().unwrap();
+            assert_eq!(restarts.load(Ordering::SeqCst), 0);
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            assert!(unrelated.try_wait().unwrap().is_none()); unrelated.kill().unwrap(); unrelated.wait().unwrap();
+        }
+        #[test]
+        fn quiescing_restarts_does_not_kill_a_live_dependency_early() {
+            let child = sleep_child(); let pid = child.id();
+            let mut service = OwnedSupervisor::start("quiesce-test".into(), child, || Ok(sleep_child())).unwrap();
+            service.pause_restarts();
+            thread::sleep(Duration::from_millis(100));
+            assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+            service.join().unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+        #[test]
+        fn dropping_a_partial_group_cleans_up_its_children() {
+            let child = sleep_child(); let pid = child.id();
+            { let _group = vec![OwnedSupervisor::start("partial-test".into(), child, || Ok(sleep_child())).unwrap()]; }
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+        #[test]
+        fn exited_service_can_restart_but_cancellation_stops_future_spawns() {
+            let first = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+            let restarts = Arc::new(AtomicUsize::new(0)); let count = restarts.clone();
+            let mut service = OwnedSupervisor::start("restart-test".into(), first, move || { count.fetch_add(1, Ordering::SeqCst); Ok(sleep_child()) }).unwrap();
+            let until = Instant::now()+Duration::from_secs(4);
+            while restarts.load(Ordering::SeqCst)==0 && Instant::now()<until { thread::sleep(Duration::from_millis(20)); }
+            assert_eq!(restarts.load(Ordering::SeqCst),1);
+            service.join().unwrap(); let stopped = restarts.load(Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(100)); assert_eq!(restarts.load(Ordering::SeqCst), stopped);
+        }
+    }
+}
+// END OWNED_SUPERVISOR_CORE
+
+/// A whole startup chain. Quiesce first suppresses future restarts without
+/// signalling live processes; reverse-order join then stops dependent HALs
+/// before their directories. No running service is adopted by numeric PID.
+#[derive(Default)]
+pub struct ServiceGroup { supervisors: Vec<owned_supervisor::OwnedSupervisor> }
+impl ServiceGroup {
+    pub fn append(&mut self, mut other: Self) { self.supervisors.append(&mut other.supervisors); }
+    pub fn check(&self) -> Result<()> {
+        for supervisor in &self.supervisors { supervisor.check()?; }
+        Ok(())
+    }
+    pub fn stop(&mut self) -> Result<()> {
+        for supervisor in &self.supervisors { supervisor.pause_restarts(); }
+        let mut failures = Vec::new();
+        for mut supervisor in self.supervisors.drain(..).rev() {
+            if let Err(error) = supervisor.join() { failures.push(format!("{error:#}")); }
+        }
+        ensure!(failures.is_empty(), "managed service shutdown failed: {}", failures.join("; "));
+        Ok(())
+    }
+}
+impl Drop for ServiceGroup {
+    fn drop(&mut self) { if let Err(error) = self.stop() { let _ = skyward_sys::kmsg(&format!("managed service group cleanup: {error:#}")); } }
+}
+
+/// Cancellable alternative to the legacy fire-and-forget startup API. Existing
+/// processes are not adopted or killed: caller must arrange explicit ownership
+/// transfer before starting a managed chain.
+pub fn start_managed(programs: &[Started], libraries: Option<&Path>) -> Result<ServiceGroup> {
+    let known = accounts();
+    let mut group = ServiceGroup::default();
+    for program in programs {
+        let (s, who, given) = readied(program, libraries, &known)?;
+        ensure!(running(&s.path).is_none(), "{} already runs outside this managed group; refusing duplicate or unowned termination", s.path);
+        if s.oneshot {
+            let status = to_its_end(&s, &who, &given)?;
+            ensure!(status.success(), "{} {} ended: {status}", s.path, s.args.join(" "));
+            continue;
+        }
+        if let Some(property) = &s.ready_property {
+            if skyward_sys::prop(property).is_some_and(|value| !value.is_empty()) { skyward_sys::set_prop(property, "")?; }
+        }
+        let waiting = s.clone();
+        let spawn = move || -> Result<std::process::Child> {
+            ensure!(running(&s.path).is_none(), "{} has an unowned process; refusing restart adoption", s.path);
+            let handed = given.make()?;
+            let child = command(&s, &who, &given, &handed).spawn().with_context(|| format!("start managed {}", s.path))?;
+            drop(handed);
+            Ok(child)
+        };
+        let child = spawn()?;
+        let name = Path::new(&waiting.path).file_name().map_or_else(|| waiting.path.clone(), |name| name.to_string_lossy().into_owned());
+        group.supervisors.push(owned_supervisor::OwnedSupervisor::start(name, child, spawn)?);
+        ready(&waiting)?; // On any partial-start error, group Drop reaps owners.
+    }
+    Ok(group)
+}
+
 /// Run `program` once to its end and give how it ended, as init runs a
 /// program one of its scripts has it run before it goes on: however the
 /// program ends, init goes on, and so may whoever asks here. It runs as
@@ -320,6 +538,16 @@ fn set_capabilities(mask: u64) -> io::Result<()> {
     }
 }
 
+fn hardware_directory_ready() -> bool {
+    let check = || -> Result<bool> {
+        let binder = skyward_binder::driver::Binder::hardware()?;
+        let directory = binder.directory()?;
+        let descriptor = skyward_binder::hidl::describes(&directory)?;
+        Ok(matches!(descriptor.as_str(), "android.hidl.manager@1.0::IServiceManager" | "android.hidl.manager@1.1::IServiceManager" | "android.hidl.manager@1.2::IServiceManager"))
+    };
+    check().unwrap_or(false)
+}
+
 /// Wait until the program has what it says it will be ready with.
 fn ready(s: &Service) -> Result<()> {
     let waited_on = match (&s.ready_property, &s.ready_service, &s.ready_hardware_service) {
@@ -331,9 +559,11 @@ fn ready(s: &Service) -> Result<()> {
     let until = Instant::now() + READY_TIMEOUT;
     loop {
         if let Some(name) = &s.ready_property
-            && skyward_sys::prop(name).is_some_and(|v| !v.is_empty())
+            && skyward_sys::prop(name).is_some_and(|v| !v.is_empty() && (name != "hwservicemanager.ready" || v == "true"))
         {
-            return Ok(());
+            if name != "hwservicemanager.ready" || hardware_directory_ready() {
+                return Ok(());
+            }
         }
         // Either directory may itself be starting again, and until it
         // answers nothing can be looked up in it.
@@ -391,7 +621,10 @@ fn run(s: &Service, who: &Credentials, given: &Given) -> Result<String> {
 /// searched after those it is given here.
 fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, OwnedFd)]) -> Command {
     let mut cmd = Command::new(&s.path);
-    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null());
+    // Preserve vendor loader/init errors in the userdebug recovery wrapper.
+    // A missing symbol otherwise appears only as exit status 1 during ready().
+    cmd.stderr(if skyward_sys::prop("ro.build.type").as_deref() == Some("userdebug") { Stdio::inherit() } else { Stdio::null() });
     let mut libraries = s.libraries.clone();
     for (name, value) in &given.environment {
         match name == LIBRARY_PATH {
@@ -448,6 +681,57 @@ pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
             }
         }
     }
+    pin_files(files, mounted)
+}
+
+/// PGZ110-only caller opt-in: preserve the two audited init-owned services
+/// whose vendor-backed ELF mappings outlive the managed key/TEE chain.
+/// This does not adopt, stop, signal, or supervise any init service.
+pub fn pin_init_owned(mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
+    let mut files = BTreeSet::new();
+    let mut identities = Vec::new();
+    for (service, executable) in [
+        ("vndservicemanager", "/vendor/bin/vndservicemanager"),
+        ("healthd", "/system/bin/android.hardware.health@2.1-service"),
+    ] {
+        let state = skyward_sys::prop(&format!("init.svc.{service}"));
+        if matches!(state.as_deref(), None | Some("stopped")) { continue; }
+        ensure!(state.as_deref() == Some("running"), "init service {service} is transitioning; retry after it settles");
+        let pid = verified_init_pid(service, executable)?;
+        let process = Process::new(pid as i32).with_context(|| format!("open verified init process {pid}"))?;
+        let started = process.stat()?.starttime;
+        for map in process.maps().with_context(|| format!("read verified {service} mappings"))? {
+            if let MMapPath::Path(path) = map.pathname { files.insert(path); }
+        }
+        for fd in process.fd().with_context(|| format!("read verified {service} open files"))? {
+            if let FDTarget::Path(path) = fd.with_context(|| format!("read verified {service} descriptor"))?.target { files.insert(path); }
+        }
+        ensure!(verified_init_pid(service, executable)? == pid, "init service {service} changed while its files were inspected");
+        skyward_sys::kmsg(&format!("preserving verified init-owned {service} PID {pid} mappings before partition release"))?;
+        identities.push((service, executable, pid, started));
+    }
+    let busy = pin_files(files, mounted)?;
+    for (service, executable, pid, started) in identities {
+        ensure!(verified_init_pid(service, executable)? == pid && Process::new(pid as i32)?.stat()?.starttime == started, "init service {service} changed while its files were pinned; refusing partition release");
+    }
+    Ok(busy)
+}
+
+fn verified_init_pid(service: &str, executable: &str) -> Result<u32> {
+    let key = format!("init.svc_debug_pid.{service}");
+    let pid: u32 = skyward_sys::prop(&key).with_context(|| format!("init gives no PID for {service}"))?.parse().context("invalid init service PID")?;
+    ensure!(pid > 1, "invalid init service PID");
+    let process = Process::new(pid as i32).with_context(|| format!("open init service {service}"))?;
+    ensure!(process.stat()?.ppid == 1, "{service} PID {pid} is not init-owned");
+    ensure!(process.exe()? == Path::new(executable), "{service} PID {pid} does not run the audited executable");
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let ids = status.lines().find_map(|line| line.strip_prefix("Uid:")).context("process status has no UID")?;
+    ensure!(ids.split_whitespace().count() == 4 && ids.split_whitespace().all(|id| id == "0"), "{service} does not have the audited root credentials");
+    ensure!(skyward_sys::prop(&key).as_deref() == Some(pid.to_string().as_str()) && skyward_sys::prop(&format!("init.svc.{service}")).as_deref() == Some("running"), "init service {service} changed identity during validation");
+    Ok(pid)
+}
+
+fn pin_files(files: BTreeSet<PathBuf>, mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
     let mut busy: Vec<PathBuf> = Vec::new();
     for file in files {
         let Some(m) = mounted.iter().find(|m| file.starts_with(&m.mount_point)) else { continue };

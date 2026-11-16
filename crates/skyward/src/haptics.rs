@@ -29,7 +29,42 @@ const TICKS_REST: Duration = Duration::from_millis(40);
 /// playing after its samples have run out, even when told to stop, until
 /// the click is taken away. So each click is loaded as it is played, at the
 /// strength the slider gives, and taken away once it has played out.
-pub struct Haptics {
+pub enum Haptics {
+    ForceFeedback(ForceFeedback),
+    Led(LedMotor),
+}
+
+pub struct LedMotor { cfg: skyward_config::LedHaptics, strength: Strength }
+
+impl Haptics {
+    pub fn open(cfg: &skyward_config::Haptics) -> Result<Self> {
+        if cfg.backend == skyward_config::HapticsBackend::Aw8697Led {
+            let led=cfg.led.clone().context("missing audited LED haptics profile")?;
+            let at=std::path::Path::new(&led.path);
+            ensure!(led.path=="/sys/class/leds/vibrator", "unrecognised motor path");
+            ensure!(fs::read_to_string(at.join("device_id"))?.trim()=="815", "LED motor is not the audited AW8697 815");
+            for name in ["duration","activate","gain"] { ensure!(at.join(name).exists(), "motor lacks {name}"); }
+            return Ok(Self::Led(LedMotor { cfg: led, strength: cfg.strength }));
+        }
+        Ok(Self::ForceFeedback(ForceFeedback::open(cfg)?))
+    }
+    pub fn click(&mut self, position: f32) -> Result<Duration> { match self { Self::ForceFeedback(ff)=>ff.click(position),Self::Led(led)=>led.start(false,share(&led.strength,position)) } }
+    pub fn ticks(&mut self) -> Result<Duration> { match self { Self::ForceFeedback(ff)=>ff.ticks(),Self::Led(led)=>led.start(true,TICKS_STRENGTH) } }
+}
+
+impl LedMotor {
+    fn start(&mut self, ticks: bool, strength: f32) -> Result<Duration> {
+        let (duration,gain)=crate::led_haptics::plan(&self.cfg,ticks,strength)?;
+        let path=std::path::Path::new(&self.cfg.path);
+        fs::write(path.join("activate"),"0")?;
+        fs::write(path.join("gain"), gain.to_string())?;
+        fs::write(path.join("duration"),duration.to_string())?;
+        fs::write(path.join("activate"),"1")?;
+        Ok(Duration::from_millis(u64::from(duration)))
+    }
+}
+
+pub struct ForceFeedback {
     dev: File,
     click: Click,
     ticks: Click,
@@ -50,11 +85,11 @@ enum Click {
     Samples { data: Vec<i8>, rate: u32 },
 }
 
-impl Haptics {
+impl ForceFeedback {
     /// The force-feedback device and the configured click. Loading a click
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
-    pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+    pub fn open(cfg: &skyward_config::Haptics) -> Result<ForceFeedback> {
         let (path, dev) = motor()?;
         let hz = resonance(&cfg.resonance)?;
         let click = match cfg.click {
@@ -68,7 +103,7 @@ impl Haptics {
             }
         };
         let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(ForceFeedback { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after

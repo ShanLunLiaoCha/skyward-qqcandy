@@ -84,6 +84,21 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
+    /// Explicit opt-in for the researched PGZ110 Trustonic 510 daemon.
+    /// Existing secure storage may be written; never enables reformat.
+    #[serde(default)]
+    pub trustonic: Option<Trustonic>,
+}
+
+/// A deliberately narrow, opt-in Trustonic startup profile. No arbitrary
+/// arguments: the daemon path, P1 store and required HAL binaries are fixed to
+/// the researched PGZ110 ABI. Unknown options fail rather than being ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Trustonic {
+    pub allow_persistent_writes: bool,
+    #[serde(default)]
+    pub libraries: Vec<String>,
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -104,6 +119,24 @@ pub struct Stock {
 /// wpa_supplicant, which joins networks.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Wlan {
+    /// Directory protocol used by the vendor supplicant. Control commands
+    /// still use its Unix socket; HIDL names must not enter an AIDL manifest.
+    #[serde(default)]
+    pub protocol: ServiceProtocol,
+    /// Optional MTK conninfra init before loading the Wi-Fi subdriver.
+    #[serde(default)]
+    pub bootstrap: Option<WlanBootstrap>,
+    /// Optional character-device Wi-Fi power switch, retained across toggles.
+    #[serde(default)]
+    pub power: Option<WlanPower>,
+    /// Existing MTK Wi-Fi calibration loaded read-only into the driver RAM.
+    /// No defaults, MAC overrides, file creation or calibration writes.
+    #[serde(default)]
+    pub nvram: Option<WlanNvram>,
+    /// Modules whose registration triggers joint calibration, loaded only after
+    /// the existing Wi-Fi calibration buffer has been accepted by the driver.
+    #[serde(default)]
+    pub calibration_modules: Vec<String>,
     /// The driver's kernel modules; what they depend on loads first.
     pub modules: Vec<String>,
     /// What is written once they are in, each value to its file, such as
@@ -129,6 +162,42 @@ pub struct Wlan {
     /// The page the stock system asks over plain HTTP to tell whether a
     /// network reaches the internet, which answers 204 with nothing.
     pub probe: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceProtocol { #[default] Aidl, Hidl }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WlanBootstrap {
+    pub modules: Vec<String>,
+    pub program: String,
+    pub ready_property: String,
+    pub ready_value: String,
+    #[serde(default)]
+    pub libraries: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WlanPower {
+    pub path: String,
+    pub on: String,
+    pub off: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WlanNvram {
+    pub partition: String,
+    /// Relative directory on the existing calibration partition.
+    pub directory: String,
+    pub file: String,
+    /// Optional existing Android filename selector, not calibration contents.
+    #[serde(default)]
+    pub selector: Option<String>,
+    pub device: String,
 }
 
 /// A value written to a file, such as a switch in sysfs.
@@ -207,6 +276,10 @@ const DATA: &str = "/data";
 /// and the ticks of the screen going off by the power key, made too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
+    #[serde(default)]
+    pub backend: HapticsBackend,
+    #[serde(default)]
+    pub led: Option<LedHaptics>,
     /// The driver's number for a click waveform it keeps, on phones whose
     /// driver plays the waveforms it keeps.
     #[serde(default)]
@@ -215,6 +288,19 @@ pub struct Haptics {
     /// tenths of a hertz whatever its label.
     pub resonance: String,
     pub strength: Strength,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HapticsBackend { #[default] ForceFeedback, Aw8697Led }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedHaptics {
+    pub path: String,
+    pub click_ms: u32,
+    pub ticks_ms: u32,
+    pub max_gain: u8,
 }
 
 /// How strongly the click plays, each as a share of the most its waveform
@@ -256,13 +342,66 @@ pub struct Names {
     pub en: String,
 }
 
+/// Where recovery lives. Vendor boot ports must not use operations that
+/// assume an independently replaceable recovery partition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPartition {
+    #[default]
+    Recovery,
+    VendorBoot,
+}
+
+impl RecoveryPartition {
+    /// Refuse legacy partition operations rather than redirecting them to
+    /// vendor_boot, which also contains the installed system's boot data.
+    pub fn require_standalone(self, operation: &str) -> Result<()> {
+        ensure!(self == Self::Recovery, "{operation} is disabled for experimental vendor_boot recovery ports");
+        Ok(())
+    }
+}
+
+/// The running recovery's layout, or the legacy default outside Skyward.
+/// Config errors inside recovery fail closed; callers must propagate them.
+pub fn running_recovery_partition() -> Result<RecoveryPartition> {
+    if ramdisk::in_recovery() {
+        Ok(DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?.device.recovery_partition)
+    } else {
+        Ok(RecoveryPartition::Recovery)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderHeader {
+    #[default]
+    Recovery,
+    System,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Device {
     pub codename: String,
+    /// The stock recovery's libbinder Parcel interface header, not its Android
+    /// release label. Oplus PGZ110 stock libbinder enforces the system mark.
+    #[serde(default)]
+    pub binder_header: BinderHeader,
+    #[serde(default)]
+    pub recovery_partition: RecoveryPartition,
     #[serde(default)]
     pub brand: String,
     #[serde(default)]
     pub model: String,
+    /// Installed-system property to display as this device's model name.
+    #[serde(default = "default_model_prop")]
+    pub model_prop: String,
+    /// Recovery-only HIDL directory UID override. Must match the stock
+    /// fastbootd directory for a binder context whose manager UID persists.
+    #[serde(default)]
+    pub hidl_manager_root: bool,
+    /// Attempt the ordinary credential-free data open on normal Recovery entry.
+    #[serde(default)]
+    pub auto_open_data: bool,
     #[serde(default = "default_true")]
     pub ab: bool,
     /// SoC marketing name shown on the About page.
@@ -273,8 +412,21 @@ pub struct Device {
     pub os_version_prop: String,
 }
 
+/// Keep the legacy panel wake quirk unless a researched device opts in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    #[default]
+    PreferredThenFastest,
+    Running,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Display {
+    /// `running` resumes the last mode whose atomic commit succeeded in one
+    /// modeset. Device-specific opt-in; not a generic MediaTek assumption.
+    #[serde(default)]
+    pub resume_mode: ResumeMode,
     #[serde(default)]
     pub width: u32,
     #[serde(default)]
@@ -288,6 +440,9 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// Additional clock-only horizontal inset in density-independent pixels.
+    #[serde(default)]
+    pub clock_offset_dp: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -464,6 +619,8 @@ fn default_true() -> bool {
     true
 }
 
+fn default_model_prop() -> String { "ro.product.marketname".to_string() }
+
 fn default_os_version_prop() -> String {
     "ro.build.display.id".into()
 }
@@ -498,6 +655,17 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        ensure!(cfg.display.clock_offset_dp <= 80, "clock_offset_dp exceeds safe status-bar inset");
+        if cfg.device.hidl_manager_root {
+            ensure!(cfg.device.codename == "OP5911" && cfg.device.recovery_partition == RecoveryPartition::VendorBoot, "hidl_manager_root is restricted to the audited OP5911 vendor_boot context");
+        }
+        if let Some(trustonic) = &cfg.trustonic {
+            ensure!(trustonic.allow_persistent_writes, "[trustonic] requires allow_persistent_writes = true; FSD may write existing secure storage");
+            for library in &trustonic.libraries {
+                let path = Path::new(library);
+                ensure!(path.is_absolute() && path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))), "[trustonic] libraries: {library} is not a plain absolute directory");
+            }
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
@@ -539,6 +707,14 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
+            match haptics.backend {
+                HapticsBackend::ForceFeedback => ensure!(haptics.led.is_none(), "[haptics] FF backend does not take LED configuration"),
+                HapticsBackend::Aw8697Led => {
+                    let led=haptics.led.as_ref().context("[haptics] LED backend requires led configuration")?;
+                    ensure!(led.path=="/sys/class/leds/vibrator", "[haptics] unrecognised LED motor path");
+                    ensure!((1..=50).contains(&led.click_ms) && (1..=80).contains(&led.ticks_ms) && (1..=128).contains(&led.max_gain), "[haptics] LED duration/gain outside audited bounds");
+                }
+            }
             let file = &haptics.resonance;
             ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
@@ -581,6 +757,21 @@ impl DeviceConfig {
             );
         }
         if let Some(wlan) = &cfg.wlan {
+            if let Some(nvram) = &wlan.nvram {
+                ensure!(nvram.partition == "nvdata" && nvram.device == "/dev/wmtWifi", "[wlan.nvram] requires audited nvdata/wmtWifi protocol");
+                let directory = Path::new(&nvram.directory);
+                ensure!(!directory.is_absolute() && directory.components().all(|c| matches!(c, std::path::Component::Normal(_))), "[wlan.nvram] directory must be plain relative");
+                ensure!(!nvram.file.is_empty() && !nvram.file.contains('/') && nvram.file != "." && nvram.file != "..", "[wlan.nvram] file must be a basename");
+                if let Some(selector) = &nvram.selector { ensure!(selector == "/data/vendor/nvramwifi", "[wlan.nvram] selector is not audited"); }
+            }
+            if let Some(bootstrap) = &wlan.bootstrap {
+                ensure!(Path::new(&bootstrap.program).is_absolute(), "[wlan.bootstrap] program must be absolute");
+                ensure!(!bootstrap.ready_property.is_empty() && !bootstrap.ready_value.is_empty(), "[wlan.bootstrap] requires readiness property/value");
+            }
+            if let Some(power) = &wlan.power {
+                ensure!(power.path.starts_with("/dev/") && !Path::new(&power.path).components().any(|c| matches!(c, std::path::Component::ParentDir)), "[wlan.power] path must be a plain /dev path");
+                ensure!(!power.on.is_empty() && !power.off.is_empty() && power.on != power.off, "[wlan.power] requires distinct nonempty commands");
+            }
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
             for file in &wlan.firmware {
                 let name = Path::new(&file.name);
@@ -609,11 +800,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pgz110_clock_and_auto_data_are_explicit_with_safe_defaults() {
+        let defaults=DeviceConfig::parse("[device]\ncodename='sample'\n").unwrap();
+        assert!(!defaults.device.auto_open_data);
+        assert_eq!(defaults.display.clock_offset_dp,0);
+        let cfg=DeviceConfig::parse(include_str!("../../../devices/OP5911.toml")).unwrap();
+        assert!(cfg.device.auto_open_data);
+        assert_eq!(cfg.display.clock_offset_dp,20);
+        assert!(DeviceConfig::parse("[device]\ncodename='sample'\n[display]\nclock_offset_dp=81\n").is_err());
+    }
+    #[test]
+    fn hidl_context_uid_override_is_explicit_and_device_scoped() {
+        assert!(!DeviceConfig::parse("[device]\ncodename='sample'\n").unwrap().device.hidl_manager_root);
+        for text in ["[device]\ncodename='sample'\nhidl_manager_root=true\n", "[device]\ncodename='OP5911'\nhidl_manager_root=true\n"] {assert!(DeviceConfig::parse(text).is_err());}
+        let cfg=DeviceConfig::parse(include_str!("../../../devices/OP5911.toml")).unwrap();
+        assert!(cfg.device.hidl_manager_root);
+    }
+    #[test]
+    fn binder_header_defaults_to_recovery_and_rejects_unknown_abi() {
+        assert_eq!(DeviceConfig::parse("[device]\ncodename='sample'\n").unwrap().device.binder_header, BinderHeader::Recovery);
+        assert_eq!(DeviceConfig::parse("[device]\ncodename='sample'\nbinder_header='system'\n").unwrap().device.binder_header, BinderHeader::System);
+        assert!(DeviceConfig::parse("[device]\ncodename='sample'\nbinder_header='anything'\n").is_err());
+    }
+
+    #[test]
+    fn display_resume_policy_requires_an_explicit_known_opt_in() {
+        let cfg = DeviceConfig::parse("[device]\ncodename='sample'\n").unwrap();
+        assert_eq!(cfg.display.resume_mode, ResumeMode::PreferredThenFastest);
+        let cfg = DeviceConfig::parse("[device]\ncodename='sample'\n[display]\nresume_mode='running'\n").unwrap();
+        assert_eq!(cfg.display.resume_mode, ResumeMode::Running);
+        let cfg = DeviceConfig::parse("[device]\ncodename='sample'\n[display]\nresume_mode='preferred_then_fastest'\n").unwrap();
+        assert_eq!(cfg.display.resume_mode, ResumeMode::PreferredThenFastest);
+        assert!(DeviceConfig::parse("[device]\ncodename='sample'\n[display]\nresume_mode='guess_fast'\n").is_err());
+    }
+
+    #[test]
+    fn calibration_sources_are_strict_and_cannot_target_arbitrary_files() {
+        let valid=include_str!("../../../devices/OP5911.toml");
+        assert!(DeviceConfig::parse(valid).is_ok());
+        for (old,new) in [("partition = \"nvdata\"","partition = \"userdata\""), ("directory = \"APCFG/APRDEB\"","directory = \"../APCFG\""), ("device = \"/dev/wmtWifi\"","device = \"/data/fake-device\""), ("file = \"WIFI\"","file = \"../WIFI\"")] {
+            assert!(valid.contains(old));
+            assert!(DeviceConfig::parse(&valid.replace(old,new)).is_err());
+        }
+    }
+    #[test]
+    fn aw8697_led_haptics_requires_explicit_bounded_driver_profile() {
+        let base="[device]\ncodename='sample'\n[haptics]\nbackend='aw8697_led'\nresonance='/sys/class/leds/vibrator/f0'\nstrength={lightest=0.25,strongest=0.75}\n[haptics.led]\npath='/sys/class/leds/vibrator'\nclick_ms=18\nticks_ms=30\nmax_gain=128\n";
+        let cfg=DeviceConfig::parse(base).unwrap();assert_eq!(cfg.haptics.unwrap().backend,HapticsBackend::Aw8697Led);
+        for (from,to) in [("click_ms=18","click_ms=0"),("ticks_ms=30","ticks_ms=81"),("max_gain=128","max_gain=129"),("path='/sys/class/leds/vibrator'","path='/sys/class/leds/charging'")] {
+            assert!(DeviceConfig::parse(&base.replace(from,to)).is_err());
+        }
+        assert!(DeviceConfig::parse(&base.replace("backend='aw8697_led'","backend='force_feedback'")).is_err());
+    }
+    #[test]
+    fn pgz110_uses_the_normal_recovery_configuration() {
+        let text = include_str!("../../../devices/OP5911.toml");
+        let cfg = DeviceConfig::parse(text).unwrap();
+        assert_eq!(cfg.device.codename, "OP5911");
+        assert_eq!(cfg.device.recovery_partition, RecoveryPartition::VendorBoot);
+        assert_eq!(cfg.display.density, 480);
+        assert_eq!(cfg.display.resume_mode, ResumeMode::Running);
+        let wlan = cfg.wlan.as_ref().expect("researched MTK WLAN profile");
+        assert_eq!(wlan.protocol, ServiceProtocol::Hidl);
+        assert_eq!(wlan.bootstrap.as_ref().unwrap().modules, ["conninfra"]);
+        assert_eq!(wlan.modules, ["wmt_chrdev_wifi_connac2", "wlan_drv_gen4m_6895"]);
+        assert_eq!(wlan.calibration_modules, ["bt_drv_6895"]);
+        assert_eq!(wlan.nvram.as_ref().unwrap().partition, "nvdata");
+        assert_eq!(wlan.power.as_ref().unwrap().path, "/dev/wmtWifi");
+        assert_eq!(cfg.modules.sources, ["vendor_boot", "vendor_dlkm", "vendor"]);
+        assert!(!text.contains("[boot]"));
+        assert!(!text.contains("diagnostic = true"));
+    }
+
+    #[test]
+    fn recovery_layout_defaults_to_standalone_and_rejects_unknown_names() {
+        let cfg = DeviceConfig::parse("[device]\ncodename = 'sample'\n").unwrap();
+        assert_eq!(cfg.device.recovery_partition, RecoveryPartition::Recovery);
+        let cfg = DeviceConfig::parse("[device]\ncodename = 'sample'\nrecovery_partition = 'vendor_boot'\n").unwrap();
+        assert_eq!(cfg.device.recovery_partition, RecoveryPartition::VendorBoot);
+        assert!(DeviceConfig::parse("[device]\ncodename = 'sample'\nrecovery_partition = 'boot'\n").is_err());
+    }
+
+    #[test]
+    fn vendor_boot_refuses_legacy_recovery_operations() {
+        for operation in ["Skyward self-update", "keeping recovery", "dual boot"] {
+            assert!(RecoveryPartition::Recovery.require_standalone(operation).is_ok());
+            let why = RecoveryPartition::VendorBoot.require_standalone(operation).unwrap_err().to_string();
+            assert!(why.contains(operation) && why.contains("vendor_boot"));
+        }
+    }
+
+    #[test]
     fn the_commands_sit_beside_the_recovery_service_binary() {
         let folder = |path: &str| Path::new(path).parent().map(Path::to_path_buf);
         for command in ramdisk::COMMANDS {
             assert_eq!(folder(command), folder(ramdisk::RECOVERY), "{command}");
         }
+    }
+
+    #[test]
+    fn trustonic_is_explicit_and_rejects_unsafe_options() {
+        let minimal = DeviceConfig::parse("[device]\ncodename = \"OP5911\"\n").unwrap();
+        assert!(minimal.trustonic.is_none());
+        let base = "[device]\ncodename = \"OP5911\"\n[trustonic]\n";
+        assert!(DeviceConfig::parse(&format!("{base}allow_persistent_writes = false\n")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}allow_persistent_writes = true\nargs = [\"--sfs-reformat\"]\n")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}allow_persistent_writes = true\nlibraries = [\"relative/path\"]\n")).is_err());
+        let enabled = DeviceConfig::parse(&format!("{base}allow_persistent_writes = true\nlibraries = [\"/system/lib64\", \"/vendor/lib64\"]\n")).unwrap();
+        assert!(enabled.trustonic.unwrap().allow_persistent_writes);
     }
 
     #[test]
@@ -885,6 +1179,21 @@ mod tests {
             let text = format!("[device]\ncodename = \"x\"\n[wipe]\nlogs = [\"{bad}\"]\n");
             assert!(DeviceConfig::parse(&text).is_err(), "{bad} is refused");
         }
+    }
+
+    #[test]
+    fn mtk_wlan_has_explicit_hidl_bootstrap_and_character_power() {
+        let text = "[device]\ncodename='OP5911'\n[wlan]\nprotocol='hidl'\nmodules=['wmt_chrdev_wifi_connac2','wlan_drv_gen4m_6895']\ninterface='wlan0'\nsupplicant='/vendor/bin/hw/wpa_supplicant'\nservice='android.hardware.wifi.supplicant@1.4::ISupplicant/default'\nprobe='http://connectivitycheck.gstatic.com/generate_204'\n[wlan.bootstrap]\nmodules=['conninfra']\nprogram='/vendor/bin/conninfra_loader'\nready_property='vendor.connsys.driver.ready'\nready_value='yes'\n[wlan.power]\npath='/dev/wmtWifi'\non='1'\noff='0'\n";
+        let wlan = DeviceConfig::parse(text).unwrap().wlan.unwrap();
+        assert_eq!(wlan.protocol, ServiceProtocol::Hidl);
+        assert_eq!(wlan.bootstrap.unwrap().modules, ["conninfra"]);
+        assert_eq!(wlan.power.unwrap().on, "1");
+        assert!(DeviceConfig::parse(&text.replace("/dev/wmtWifi", "/data/unsafe")).is_err());
+        assert!(DeviceConfig::parse(&text.replace("off='0'", "off='1'")).is_err());
+        assert!(DeviceConfig::parse(&text.replace("protocol='hidl'", "protocol='unknown'")).is_err());
+        let old = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap().wlan.unwrap();
+        assert_eq!(old.protocol, ServiceProtocol::Aidl);
+        assert!(old.bootstrap.is_none() && old.power.is_none());
     }
 
     #[test]

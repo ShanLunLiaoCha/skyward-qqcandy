@@ -1623,15 +1623,15 @@ const WIPE_GROUPS: [(Text, &[Wipe]); 2] = [
 /// for one tell it; in English as it goes on from what leads to it, its
 /// first letter small.
 fn factory_reset(s: &State) -> String {
-    let also = s.lang.pick(match s.cache_partition {
-        true => ["metadata 和 cache 分区", "metadata 和 cache 分割區", "the metadata and cache partitions"],
-        false => ["metadata 分区", "metadata 分割區", "the metadata partition"],
+    let cache = s.lang.pick(match s.cache_partition {
+        true => ["，最后格式化 cache 分区", "，最後格式化 cache 分割區", ", then formats cache"],
+        false => ["", "", ""],
     });
     tr!(
         s.lang,
-        "清空 data 分区，包括应用、账户、设置和内部存储，并格式化 {also}",
-        "清空 data 分割區，包括應用程式、帳戶、設定和內部儲存空間，並格式化 {also}",
-        "empties the data partition, apps, accounts, settings and internal storage included, and formats {also}"
+        "先关闭 data，再格式化 metadata，随后格式化 data{cache}；应用、账户、设置、内部存储和原加密密钥均不可恢复，后续步骤失败也无法回滚",
+        "先關閉 data，再格式化 metadata，隨後格式化 data{cache}；應用程式、帳戶、設定、內部儲存空間與原加密金鑰均無法復原，後續步驟失敗也無法回復",
+        "closes data, formats metadata first, then formats data{cache}; apps, accounts, settings, internal storage and old encryption keys are irrecoverable, even if a later step fails"
     )
 }
 

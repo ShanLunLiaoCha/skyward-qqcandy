@@ -21,9 +21,9 @@ pub const BY_NAME: &str = "/dev/block/by-name";
 /// matching `ro.boot.*` properties; these files come from the kernel.
 pub fn boot_param(key: &str) -> Result<Option<String>> {
     for src in ["/proc/bootconfig", "/proc/cmdline"] {
-        match fs::read_to_string(src) {
-            Ok(s) => {
-                if let Some(v) = find_kv(&s, key) {
+        match fs::read(src) {
+            Ok(bytes) => {
+                if let Some(v) = find_kv_bytes(&bytes, key)? {
                     return Ok(Some(v));
                 }
             }
@@ -37,6 +37,16 @@ pub fn boot_param(key: &str) -> Result<Option<String>> {
 /// Active slot suffix (`_a` / `_b`), or `None` on devices that are not A/B.
 pub fn slot_suffix() -> Result<Option<String>> {
     boot_param("androidboot.slot_suffix")
+}
+
+fn find_kv_bytes(bytes: &[u8], key: &str) -> Result<Option<String>> {
+    // PGZ110 bootloader appends opaque Phoenix/history bytes to cmdline.
+    // Decode unrelated bytes lossily, but never invent a corrupted value for
+    // the requested boot parameter. Preserve real I/O errors in the caller.
+    let text = String::from_utf8_lossy(bytes);
+    let value = find_kv(&text, key);
+    anyhow::ensure!(!value.as_deref().is_some_and(|v| v.contains('\u{fffd}')), "boot parameter {key} contains invalid UTF-8");
+    Ok(value)
 }
 
 fn find_kv(haystack: &str, key: &str) -> Option<String> {
@@ -143,6 +153,15 @@ pub fn drop_cache(_: &fs::File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pgz110_opaque_history_byte_does_not_break_other_boot_parameters() {
+        let bytes = b"androidboot.slot_suffix=_a stage \x02 count \x01 history \xf6 oplusboot.mode=recovery androidboot.verifiedbootstate=orange";
+        assert_eq!(find_kv_bytes(bytes, "androidboot.slot_suffix").unwrap().as_deref(), Some("_a"));
+        assert_eq!(find_kv_bytes(bytes, "androidboot.verifiedbootstate").unwrap().as_deref(), Some("orange"));
+        assert_eq!(find_kv_bytes(bytes, "androidboot.vbmeta.device_state").unwrap(), None);
+        assert!(find_kv_bytes(b"androidboot.slot_suffix=_\xff", "androidboot.slot_suffix").is_err());
+    }
 
     #[test]
     fn parses_slot_from_cmdline() {

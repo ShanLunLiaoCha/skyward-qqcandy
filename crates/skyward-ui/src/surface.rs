@@ -484,6 +484,7 @@ pub mod kms {
         back: usize,
         /// A frame was committed whose flip has not come yet.
         flipping: bool,
+        pending_mode: Option<property::Value<'static>>,
         /// The planes showing the buffer, one per layer mixer, with their
         /// FB_ID properties.
         planes: Vec<(plane::Handle, property::Handle)>,
@@ -492,10 +493,12 @@ pub mod kms {
         crtc: drm::control::crtc::Handle,
         active: property::Handle,
         mode_id: property::Handle,
-        /// The panel's preferred mode, which it comes up in, and its
-        /// fastest, which it switches to after, where that is another.
-        preferred: property::Value<'static>,
+        /// The panel's fastest mode, selected after initial preferred-mode
+        /// startup. Preferred/running resume state is kept below.
         fastest: Option<property::Value<'static>>,
+        /// Last successful mode and the device-specific wake policy. No cache
+        /// mutation is made for failed ioctls or failed flip completion.
+        resume: crate::resume_policy::ResumeState<property::Value<'static>>,
         /// The sub-pixel rendering setup the CRTC takes with each mode,
         /// where the panel leaves its sub-pixel rendering to the display.
         spr: Option<(property::Handle, property::Value<'static>)>,
@@ -516,6 +519,12 @@ pub mod kms {
 
     impl KmsSurface {
         pub fn open(path: &str) -> Result<Self> {
+            Self::open_with_resume_policy(path, crate::resume_policy::ResumeMode::PreferredThenFastest)
+        }
+
+        /// Explicit device opt-in only. Cold startup still uses the preferred
+        /// mode and then the fastest, preserving the existing panel bring-up.
+        pub fn open_with_resume_policy(path: &str, resume_mode: crate::resume_policy::ResumeMode) -> Result<Self> {
             let card = open_card(path)?;
             let res = card.resource_handles().context("read KMS resources")?;
 
@@ -728,17 +737,18 @@ pub mod kms {
                 Err(_) => None,
             };
             let conn = conn.handle();
-            let s = KmsSurface {
+            let mut s = KmsSurface {
                 card,
                 bufs,
                 back: 1,
                 flipping: false,
+                pending_mode: None,
                 planes,
                 crtc,
                 active,
                 mode_id,
-                preferred: first,
                 fastest,
+                resume: crate::resume_policy::ResumeState::new(resume_mode, first, fastest),
                 spr,
                 conn,
                 lp,
@@ -804,16 +814,17 @@ pub mod kms {
             Ok(())
         }
 
-        /// Switch a panel that came on again in its preferred mode to its
-        /// fastest. It is called once the backlight is on, which need not
-        /// wait the frames the switch takes.
-        pub fn speed_up(&mut self) -> Result<()> {
+        /// Switch a legacy-policy panel that came on in its preferred mode
+        /// to its fastest. Returns whether a mode change was completed so the
+        /// caller can restore backlight only after all modesets have settled.
+        pub fn speed_up(&mut self) -> Result<bool> {
             if self.slow {
                 self.settle()?;
                 self.to_fastest()?;
                 self.slow = false;
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
         }
 
         /// The panel, up in its preferred mode, switched to its fastest.
@@ -822,14 +833,16 @@ pub mod kms {
         /// its TE at 60 Hz, and every frame waits two TEs. Switching a
         /// running panel sends it the commands for the new rate, as Android's
         /// switches do.
-        fn to_fastest(&self) -> Result<()> {
+        fn to_fastest(&mut self) -> Result<()> {
             let Some(fastest) = self.fastest else { return Ok(()) };
             let mut req = atomic::AtomicModeReq::new();
             req.add_property(self.crtc, self.mode_id, fastest);
             if let Some((id, setup)) = self.spr {
                 req.add_property(self.crtc, id, setup);
             }
-            commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET).context("switch the panel to its fastest refresh")
+            commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET).context("switch the panel to its fastest refresh")?;
+            self.resume.committed(fastest);
+            Ok(())
         }
     }
 
@@ -888,9 +901,10 @@ pub mod kms {
                     req.add_property(self.conn, id, property::Value::UnsignedRange(run));
                 }
             }
-            if self.power == Power::Off {
+            let resume_plan = (self.power == Power::Off).then(|| self.resume.plan());
+            if let Some(plan) = resume_plan {
                 req.add_property(self.crtc, self.active, property::Value::Boolean(true));
-                req.add_property(self.crtc, self.mode_id, self.preferred);
+                req.add_property(self.crtc, self.mode_id, plan.mode);
                 if let Some((id, setup)) = self.spr {
                     req.add_property(self.crtc, id, setup);
                 }
@@ -898,8 +912,9 @@ pub mod kms {
             }
             self.settle()?;
             self.card.atomic_commit(flags, req).context(if self.power == Power::On { "flip" } else { "turn the display on" })?;
-            if self.power == Power::Off {
-                self.slow = self.fastest.is_some();
+            if let Some(plan) = resume_plan {
+                self.slow = plan.speed_up_after;
+                self.pending_mode = Some(plan.mode);
             }
             self.power = Power::On;
             self.flipping = true;
@@ -911,6 +926,7 @@ pub mod kms {
             if self.flipping {
                 flipped(&self.card).context("flip")?;
                 self.flipping = false;
+                if let Some(mode) = self.pending_mode.take() { self.resume.committed(mode); }
             }
             Ok(())
         }

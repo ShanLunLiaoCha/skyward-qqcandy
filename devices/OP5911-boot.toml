@@ -1,0 +1,28 @@
+# First-boot/UI-only diagnostic profile. Stock kernel/DTB/modules retained.
+[device]
+codename = "OP5911"
+brand = "OnePlus"
+model = "PGZ110"
+ab = true
+recovery_partition = "vendor_boot"
+soc = { hans = "联发科 MT6895", hant = "聯發科 MT6895", en = "MediaTek MT6895" }
+os_version_prop = "ro.build.version.oplusrom"
+
+[boot]
+diagnostic = true
+
+[display]
+width = 0
+height = 0
+density = 480
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = []
+
+[partitions]
+mounted = []
+
+# No dynamic-partition prepare, TEE, APEX, data opening, extra vendor service,
+# settings writes, USB transfer switch or suspend. Stock init keeps its display,
+# input and touch-driver startup. Build ONLY with --diagnostic-init.

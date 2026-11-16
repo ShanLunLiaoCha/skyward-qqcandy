@@ -37,6 +37,11 @@ pub fn check(image: &[u8], codename: &str) -> Result<()> {
 /// build goes into, slot A first: `next`, the slot that starts next, and
 /// any other whose partition holds Skyward now, any build of it.
 pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
+    slots_for_layout(dir, next, skyward_config::running_recovery_partition()?)
+}
+
+fn slots_for_layout(dir: &Path, next: Slot, layout: skyward_config::RecoveryPartition) -> Result<Vec<Slot>> {
+    layout.require_standalone("Skyward self-update")?;
     let mut slots = Vec::new();
     for slot in [Slot::A, Slot::B] {
         let path = image::device(dir, PARTITION, slot);
@@ -52,6 +57,11 @@ pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
 /// Write `image` into the recovery partitions of `slots`, among the links
 /// in `dir`, and read each back; `progress` hears the bytes so far, of all.
 pub fn write(dir: &Path, image: &[u8], slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    write_for_layout(dir, image, slots, progress, skyward_config::running_recovery_partition()?)
+}
+
+fn write_for_layout(dir: &Path, image: &[u8], slots: &[Slot], progress: &mut dyn FnMut(u64, u64), layout: skyward_config::RecoveryPartition) -> Result<()> {
+    layout.require_standalone("Skyward self-update")?;
     let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(dir, PARTITION, slot)).collect();
     image::flash(&mut Cursor::new(image), image.len() as u64, &devices, progress)
 }
@@ -61,6 +71,17 @@ mod tests {
     use super::*;
     use crate::image::samples::{recovery, skyward_for};
     use std::io::Write;
+
+    #[test]
+    fn vendor_boot_self_update_is_rejected_before_partition_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = skyward_config::RecoveryPartition::VendorBoot;
+        assert!(slots_for_layout(dir.path(), Slot::A, layout).unwrap_err().to_string().contains("disabled"));
+        let mut called = false;
+        assert!(write_for_layout(dir.path(), b"new image", &[Slot::A], &mut |_, _| called = true, layout).unwrap_err().to_string().contains("disabled"));
+        assert!(!called);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     /// A zip of `entries`, each a name and what it holds.
     fn zipped(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {

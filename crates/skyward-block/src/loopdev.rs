@@ -15,6 +15,8 @@ mod android {
 
     const GET_FREE: u32 = 0x4C82;
     const CONFIGURE: u32 = 0x4C0A;
+    const GET_STATUS64: u32 = 0x4C05;
+    const CLEAR_FD: u32 = 0x4C01;
 
     /// The device only ever reads. It stays pointed at the file until the
     /// recovery ends, which is as long as anything mounted from it lasts.
@@ -72,6 +74,36 @@ mod android {
             return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
         }
         Ok(path)
+    }
+
+    /// Clear a freshly configured, not-mounted loop after its caller's mount
+    /// failed. Never use this to tear down an existing APEX. Both the current
+    /// backing inode and device must still match the caller-owned file.
+    pub fn detach_owned(device: &Path, backing: &Path) -> Result<()> {
+        use anyhow::ensure;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        let name = device.file_name().and_then(|name| name.to_str()).context("loop path has no plain name")?;
+        let number = name.strip_prefix("loop").context("cleanup target is not a loop device")?;
+        ensure!(!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()), "cleanup target is not a numbered loop device");
+        let source = File::options().read(true).custom_flags(libc::O_NOFOLLOW).open(backing)
+            .with_context(|| format!("open owned loop backing {}", backing.display()))?;
+        let expected = source.metadata()?;
+        ensure!(expected.is_file(), "owned loop backing is not a regular file");
+        let loop_file = File::options().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(device)?;
+        let node = loop_file.metadata()?;
+        ensure!(node.file_type().is_block_device(), "loop cleanup target is not a block device");
+        let devnum = format!("{}:{}", libc::major(node.rdev()), libc::minor(node.rdev()));
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").context("check loop cleanup mount ownership")?;
+        ensure!(!mountinfo.lines().any(|line| line.split_whitespace().nth(2) == Some(devnum.as_str())), "refusing cleanup of an already-mounted loop device");
+        let mut actual: Info = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(loop_file.as_raw_fd(), GET_STATUS64 as libc::Ioctl, &mut actual) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("inspect owned loop backing before cleanup");
+        }
+        ensure!(actual.device == expected.dev() && actual.inode == expected.ino(), "loop backing changed; refusing unrelated device cleanup");
+        if unsafe { libc::ioctl(loop_file.as_raw_fd(), CLEAR_FD as libc::Ioctl) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("clear owned unmounted loop backing");
+        }
+        Ok(())
     }
 
     /// Where the kernel put the loop device it just handed out: Android

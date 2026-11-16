@@ -15,6 +15,16 @@ const GB: u64 = 1_000_000_000;
 /// The sizes a root is offered in, in gigabytes, past what it least takes.
 const OFFERED: [u64; 6] = [8, 16, 32, 64, 128, 256];
 
+/// A vendor_boot recovery cannot safely run the legacy dual-boot fallback.
+/// Checking an empty state is allowed: ordinary installs call
+/// ensure_installed even on phones that have never used dual boot.
+#[cfg(any(target_os = "android", test))]
+fn require_dual_boot(vendor_boot: bool, state: Option<&State>) -> anyhow::Result<()> {
+    let empty = state.is_some_and(|state| *state == State::default());
+    anyhow::ensure!(!vendor_boot || empty, "dual boot is disabled for experimental vendor_boot recovery ports; existing state must be recovered with a compatible recovery, not automatically rewritten");
+    Ok(())
+}
+
 /// How far an install has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -172,6 +182,7 @@ mod sys {
     /// waits for any update to be merged, and first checks that the other
     /// system's root is still where it was put.
     pub fn switch_to(next: Slot, to: Who) -> Result<()> {
+        skyward_config::running_recovery_partition()?.require_standalone("dual boot switching")?;
         let state = state()?;
         if to == Who::Other {
             let update = skyward_vab::snapshot_state()?;
@@ -185,7 +196,9 @@ mod sys {
     /// Finish a switch cut off before, where one was; says whether there
     /// was one.
     pub fn resume() -> Result<bool> {
+        let layout = skyward_config::running_recovery_partition()?;
         let state = state()?;
+        require_dual_boot(layout == skyward_config::RecoveryPartition::VendorBoot, Some(&state))?;
         if state.switching.is_none() {
             return Ok(false);
         }
@@ -251,6 +264,7 @@ mod sys {
     /// is none yet. `slot` is the slot the phone runs from, whose
     /// init_boot image lends its header.
     pub fn install<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, progress: &mut dyn FnMut(Step)) -> Result<()> {
+        skyward_config::running_recovery_partition()?.require_standalone("dual boot installation")?;
         writable(|| install_now(zip, contents, size, program, slot, progress))
     }
 
@@ -388,6 +402,31 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendor_boot_allows_empty_state_but_never_dual_boot_work_or_existing_state() {
+        let empty = State::default();
+        assert!(require_dual_boot(true, Some(&empty)).is_ok());
+        assert!(require_dual_boot(true, None).is_err());
+        let occupied = State { occupied: Some("_a".into()), ..State::default() };
+        let switching = State {
+            switching: Some(crate::state::Switching { to: crate::state::Who::Installed, slot: "_a".into(), saved: false }),
+            ..State::default()
+        };
+        let saved = State {
+            saved: Some(crate::state::Saved { entry: 0, boot: "old".into(), init_boot: "old".into() }),
+            ..State::default()
+        };
+        for state in [&occupied, &switching, &saved] {
+            assert!(require_dual_boot(true, Some(state)).is_err());
+            assert!(require_dual_boot(false, Some(state)).is_ok());
+        }
+        assert!(require_dual_boot(false, None).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let no_state = State::load(&dir.path().join("absent.toml")).unwrap();
+        assert!(require_dual_boot(true, Some(&no_state)).is_ok());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn the_room_for_a_root_keeps_a_supers_worth_for_updates() {

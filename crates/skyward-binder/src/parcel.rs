@@ -3,7 +3,28 @@ use anyhow::{bail, Context, Result};
 /// The mark libbinder writes into every call header. Both ends have to agree
 /// on it: it tells apart the copies of libbinder a phone carries, and the one
 /// the recovery's own programs are built from is the recovery copy.
-const HEADER: i32 = i32::from_be_bytes(*b"RECO");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Header { Recovery, System }
+
+impl Header {
+    fn mark(self) -> i32 {
+        match self { Self::Recovery => i32::from_be_bytes(*b"RECO"), Self::System => i32::from_be_bytes(*b"SYST") }
+    }
+}
+
+static CONFIGURED_HEADER: std::sync::OnceLock<Header> = std::sync::OnceLock::new();
+
+fn configure_at(cell: &std::sync::OnceLock<Header>, header: Header) -> Result<()> {
+    let selected = cell.get_or_init(|| header);
+    anyhow::ensure!(*selected == header, "Binder header was already configured differently");
+    Ok(())
+}
+
+/// Configure once before any Binder clients/workers start. Repeating the same
+/// configuration is harmless; switching a live process's libbinder ABI is not.
+pub fn configure_header(header: Header) -> Result<()> { configure_at(&CONFIGURED_HEADER, header) }
+
+fn selected_header() -> Header { CONFIGURED_HEADER.get().copied().unwrap_or(Header::Recovery) }
 
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
@@ -73,10 +94,14 @@ impl Parcel {
     /// A call to `interface`, opened with the header libbinder reads before
     /// it looks at anything the method itself takes.
     pub fn call(interface: &str) -> Parcel {
+        Self::call_with_header(interface, selected_header())
+    }
+
+    fn call_with_header(interface: &str, header: Header) -> Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(header.mark());
         p.string(interface);
         p
     }
@@ -305,6 +330,25 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_system_and_recovery_headers_have_exact_wire_values() {
+        for (header, mark) in [(Header::Recovery, i32::from_be_bytes(*b"RECO")), (Header::System, i32::from_be_bytes(*b"SYST"))] {
+            let parcel = Parcel::call_with_header("android.os.IServiceManager", header);
+            assert_eq!(&parcel.bytes()[8..12], &mark.to_le_bytes());
+            assert_eq!(Reader::new(parcel.bytes()).call().unwrap(), "android.os.IServiceManager");
+        }
+        assert_eq!(&Parcel::call_with_header("x", Header::System).bytes()[8..12], b"TSYS");
+    }
+
+    #[test]
+    fn explicit_header_configuration_is_idempotent_but_cannot_switch_live_abi() {
+        let cell = std::sync::OnceLock::new();
+        configure_at(&cell, Header::System).unwrap();
+        configure_at(&cell, Header::System).unwrap();
+        assert!(configure_at(&cell, Header::Recovery).is_err());
+        assert_eq!(cell.get(), Some(&Header::System));
+    }
 
     #[test]
     fn a_call_opens_with_the_header_and_the_interface_name() {

@@ -94,7 +94,12 @@ enum Section {
 pub fn read(text: &str) -> Result<Script> {
     let mut script = Script::default();
     let mut section = Section::None;
-    for (number, words) in lines(text)? {
+    // Some Oplus stock .rc files begin with a C-style copyright banner.
+    // Android logs/ignores these non-section lines; do not let an unrelated
+    // banner prevent discovery of every secure service. Only a complete,
+    // standalone file prologue is accepted, never a comment inside a section.
+    let text = without_banner(text)?;
+    for (number, words) in lines(&text)? {
         let Some(first) = words.first() else { continue };
         match first.as_str() {
             "import" => {
@@ -127,6 +132,22 @@ pub fn read(text: &str) -> Result<Script> {
         }
     }
     Ok(script)
+}
+
+/// Oplus copyright prologues are not executable init syntax. Strip only a
+/// leading standalone block, retaining line numbers and rejecting unclosed or
+/// inline syntax rather than masking commands elsewhere in the file.
+fn without_banner(text: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let first = text.trim_start();
+    if !first.starts_with("/*") { return Ok(std::borrow::Cow::Borrowed(text)); }
+    let start = text.len() - first.len();
+    let end = start + first.find("*/").context("unclosed init copyright banner")? + 2;
+    let rest = &text[end..];
+    ensure!(rest.split_once('\n').map_or(rest, |(line, _)| line).trim().is_empty(), "init copyright banner must end on its own line");
+    let mut output = String::with_capacity(text.len());
+    for c in text[..end].chars() { output.push(if c == '\n' { '\n' } else { ' ' }); }
+    output.push_str(rest);
+    Ok(std::borrow::Cow::Owned(output))
 }
 
 /// The lines of a script that hold words, each with the number of the line
@@ -277,6 +298,18 @@ fn socket(words: &[String]) -> Result<Socket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oplus_copyright_banner_does_not_hide_services_or_errors() {
+        let script = read("/********\n ** Copyright OPLUS\n ********/\nservice keys /vendor/bin/keymint\n    user system\n").unwrap();
+        assert_eq!(script.programs.len(), 1);
+        assert_eq!(script.programs[0].path, "/vendor/bin/keymint");
+        assert!(read("/* unclosed\nservice keys /vendor/bin/keymint\n").is_err());
+        assert!(read("/* header */ service keys /vendor/bin/keymint\n").is_err());
+        assert!(read("/* header */\nnot_a_section\n").is_err());
+        let error = read("/* header\n*/\nservice keys\n").unwrap_err().to_string();
+        assert!(error.contains("line 3"), "{error}");
+    }
 
     fn strings(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()

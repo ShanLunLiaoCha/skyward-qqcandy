@@ -66,10 +66,47 @@ fn bytes(p: &Partition) -> u64 {
     p.sectors() * 512
 }
 
-/// Map partition `p` from super read-only with device-mapper and mount it
-/// over its point. A device that does not mount is removed again.
+/// Validate the actual live table, not merely its name or total size. This
+/// applies only to ordinary LP linear/zero extents; snapshots and encryption
+/// targets must continue through their own lifecycle and must never be adopted.
+fn reusable_linear(status: &dm::DeviceStatus, live: &[dm::Line], expected: &[dm::Target]) -> Result<()> {
+    ensure!(status.readonly && !status.suspended && status.active_table,
+        "existing mapping is not active, resumed and read-only");
+    ensure!(!expected.is_empty() && live.len() == expected.len(), "existing mapping has a different target count");
+    let mut start = 0u64;
+    for (line, target) in live.iter().zip(expected) {
+        let (kind, text) = match target {
+            dm::Target::Linear { device: (major, minor), offset, .. } => ("linear", format!("{major}:{minor} {offset}")),
+            dm::Target::Zero { .. } => ("zero", String::new()),
+            _ => anyhow::bail!("only ordinary LP linear/zero mappings may be reused"),
+        };
+        ensure!(line.start == start && line.sectors == target.sectors() && line.kind == kind
+            && line.text.split_whitespace().eq(text.split_whitespace()),
+            "existing mapping live table differs from current super metadata");
+        start = start.checked_add(target.sectors()).context("logical partition sector count overflow")?;
+    }
+    Ok(())
+}
+
+/// Map partition `p` read-only. A detached mapping may still be held by pinned
+/// files: reuse it only after exact live-table/state validation. Never remove
+/// or reload a pre-existing mapping, including on a subsequent mount failure.
 fn map_and_mount(p: &Partition, devices: &[(u32, u32)], slot: Slot) -> Result<Mounted> {
-    let device = dm::create(&p.name, &targets(p, devices), true)?;
+    let expected = targets(p, devices);
+    let existing = dm::device_status(&p.name)?;
+    let created = existing.is_none();
+    let device = match existing {
+        Some(status) => {
+            let live = dm::table(&p.name)?;
+            reusable_linear(&status, &live, &expected).with_context(|| format!("refuse reusing existing {}", p.name))?;
+            ensure!(dm::device_status(&p.name)?.as_ref() == Some(&status) && dm::table(&p.name)? == live,
+                "existing {} changed during validation", p.name);
+            let device = PathBuf::from(format!("/dev/block/dm-{}", status.device.1));
+            ensure!(devnum(&device)? == status.device, "existing {} device node has a different identity", p.name);
+            device
+        }
+        None => dm::create(&p.name, &expected, true)?,
+    };
     let mount_point = mount_point(base(p, slot));
     let mounted = (|| -> Result<String> {
         fs::create_dir_all(&mount_point).with_context(|| format!("create {}", mount_point.display()))?;
@@ -77,10 +114,47 @@ fn map_and_mount(p: &Partition, devices: &[(u32, u32)], slot: Slot) -> Result<Mo
     })();
     match mounted {
         Ok(filesystem) => Ok(Mounted { partition: p.name.clone(), device, mount_point, filesystem }),
+        Err(e) if !created => Err(e.context(format!("existing {} mapping retained after mount failure", p.name))),
         Err(e) => Err(match dm::remove(&p.name) {
             Ok(()) => e,
             Err(r) => e.context(format!("removing {} afterwards failed too: {r:#}", p.name)),
         }),
+    }
+}
+
+#[cfg(test)]
+mod reentry_tests {
+    use super::*;
+    fn status() -> dm::DeviceStatus { dm::DeviceStatus { device: (254, 17), readonly: true, suspended: false, active_table: true } }
+    fn targets() -> Vec<dm::Target> { vec![dm::Target::Linear { sectors: 4096, device: (8, 0), offset: 2048 }, dm::Target::Zero { sectors: 8 }] }
+    fn live() -> Vec<dm::Line> { vec![dm::Line { start: 0, sectors: 4096, kind: "linear".into(), text: "8:0 2048".into() }, dm::Line { start: 4096, sectors: 8, kind: "zero".into(), text: String::new() }] }
+    #[test]
+    fn detached_exact_readonly_active_lp_mapping_is_reusable() { assert!(reusable_linear(&status(), &live(), &targets()).is_ok()); }
+    #[test]
+    fn writable_suspended_and_inactive_mappings_are_rejected() {
+        let mut writable = status(); writable.readonly = false;
+        let mut suspended = status(); suspended.suspended = true;
+        let mut inactive = status(); inactive.active_table = false;
+        for state in [writable, suspended, inactive] { assert!(reusable_linear(&state, &live(), &targets()).is_err()); }
+    }
+    #[test]
+    fn every_extent_identity_and_boundary_must_match() {
+        for variant in 0..6 {
+            let mut lines = live();
+            match variant { 0 => lines[0].start = 1, 1 => lines[0].sectors += 1,
+                2 => lines[0].text = "8:1 2048".into(), 3 => lines[0].text = "8:0 2049".into(),
+                4 => lines[1].start += 1, _ => { lines.pop(); } }
+            assert!(reusable_linear(&status(), &lines, &targets()).is_err(), "extent mismatch {variant}");
+        }
+    }
+    #[test]
+    fn snapshot_and_crypt_are_not_reused_as_linear() {
+        for kind in ["snapshot", "snapshot-merge", "default-key", "crypt"] {
+            let mut lines = live(); lines[0].kind = kind.into();
+            assert!(reusable_linear(&status(), &lines, &targets()).is_err());
+        }
+        let encrypted = vec![dm::Target::DefaultKey { sectors: 4096, device: "8:0".into(), cipher: "x".into(), key: "not-a-key".into(), wrapped: false }];
+        assert!(reusable_linear(&status(), &live()[..1], &encrypted).is_err());
     }
 }
 
