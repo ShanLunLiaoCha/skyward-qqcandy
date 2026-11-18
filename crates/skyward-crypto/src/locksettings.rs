@@ -35,6 +35,10 @@ fn value(database: &Path, name: &str, user: u32) -> Result<Option<String>> {
     let at = format!("file:{}?immutable=1", database.display());
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
     let db = rusqlite::Connection::open_with_flags(&at, flags).with_context(|| format!("open {}", database.display()))?;
+    value_in(&db, database, name, user)
+}
+
+fn value_in(db: &rusqlite::Connection, database: &Path, name: &str, user: u32) -> Result<Option<String>> {
     let mut query = db
         .prepare("SELECT value FROM locksettings WHERE name = ?1 AND user = ?2")
         .context("ask the lock settings what they keep")?;
@@ -44,7 +48,39 @@ fn value(database: &Path, name: &str, user: u32) -> Result<Option<String>> {
     let Some(row) = rows.next().with_context(|| format!("read what {} says about {name}", database.display()))? else {
         return Ok(None);
     };
-    row.get(0).with_context(|| format!("read what {name} is for user {user}"))
+    let result = row.get(0).with_context(|| format!("read what {name} is for user {user}"))?;
+    anyhow::ensure!(rows.next()?.is_none(), "duplicate lock setting {name} for user {user}");
+    Ok(result)
+}
+
+/// Only accept the positively identified no-lock configuration of the
+/// legacy owner layout. Never treat ignored SQLite WAL state as proof.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn legacy_owner_has_no_lock(database: &Path) -> Result<bool> {
+    if !std::fs::symlink_metadata(database)?.is_file() { return Ok(false); }
+    for suffix in ["-wal", "-journal"] {
+        let mut name = database.as_os_str().to_owned();
+        name.push(suffix);
+        match std::fs::symlink_metadata(name) {
+            Ok(meta) if !meta.is_file() || meta.len() != 0 => return Ok(false),
+            Ok(_) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let at = format!("file:{}?immutable=1", database.display());
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let db = rusqlite::Connection::open_with_flags(&at, flags)?;
+    let mut query = db.prepare("SELECT name, value FROM locksettings WHERE user = 0 AND name IN ('sp-handle', 'enable-sp', 'lockscreen.password_type', 'lockscreen.password_type_alternate')")?;
+    let mut rows = query.query(())?;
+    let mut alternate_seen = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let value: Option<String> = row.get(1)?;
+        if name != "lockscreen.password_type_alternate" || alternate_seen || value.as_deref() != Some("0") { return Ok(false); }
+        alternate_seen = true;
+    }
+    Ok(alternate_seen)
 }
 
 #[cfg(test)]
@@ -62,6 +98,31 @@ mod tests {
             db.execute("INSERT INTO locksettings (name, user, value) VALUES (?1, ?2, ?3)", (name, user, value)).unwrap();
         }
         at
+    }
+
+    #[test]
+    fn legacy_owner_accepts_only_a16_no_lock_records() {
+        let state = ("lockscreen.password_type_alternate", 0, Some("0"));
+        let variants = [
+            (vec![state], true),
+            (vec![], false),
+            (vec![state, ("sp-handle", 0, Some("42"))], false),
+            (vec![state, ("enable-sp", 0, Some("true"))], false),
+            (vec![state, ("lockscreen.password_type", 0, Some("131072"))], false),
+            (vec![state, state], false),
+            (vec![("lockscreen.password_type_alternate", 0, Some("131072"))], false),
+        ];
+        for (i, (rows, expected)) in variants.into_iter().enumerate() {
+            let db = scratch(&format!("a16-no-lock-{i}"), &rows);
+            assert_eq!(legacy_owner_has_no_lock(&db).unwrap(), expected);
+            if expected {
+                let wal = db.with_extension("db-wal");
+                std::fs::write(&wal, b"unapplied state").unwrap();
+                assert!(!legacy_owner_has_no_lock(&db).unwrap());
+                std::fs::remove_file(wal).unwrap();
+            }
+            std::fs::remove_file(db).unwrap();
+        }
     }
 
     #[test]

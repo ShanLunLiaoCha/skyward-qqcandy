@@ -159,6 +159,7 @@ pub struct Plan {
     /// The filesystem each partition is made afresh as, where the system
     /// asked for one.
     reformat: Option<String>,
+    ramdisk_only: bool,
 }
 
 /// Find what a factory reset erases: the data partition, the cache
@@ -167,26 +168,40 @@ pub struct Plan {
 /// by one it cannot finish for the system. The data partition is erased
 /// only as one the system makes afresh as it starts, unless `reformat`
 /// names the filesystem the system asked for it to be made as here.
+pub(crate) fn preserves_oem_cache(cfg: &skyward_config::DeviceConfig) -> bool {
+    cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot
+}
+
 pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
     let plan = (|| -> Result<Result<Plan, Refusal>> {
-        // Installation deliberately releases vendor/odm/system mounts. Reopen
-        // the current slot read-only before reading its fstab or resolving
-        // formatters; never interpret missing mounts as an absent data entry,
-        // and never substitute stale pre-install filesystem/encryption flags.
-        if let Some(slot) = skyward_vab::current_slot()? {
-            let mounts = skyward_vab::mount_partitions(slot)
-                .context("restore current-slot read-only partition sources before factory-reset planning")?;
-            for damage in &mounts.damaged { skyward_sys::kmsg(&format!("reset planning super metadata: {damage}"))?; }
-        }
-        if let Some(hold) = update_hold()? {
+        let cfg = skyward_config::DeviceConfig::load(Path::new("/").join(skyward_config::ramdisk::CONFIG))?;
+        let ramdisk_only = preserves_oem_cache(&cfg);
+        let (data, metadata, cache) = if ramdisk_only {
+            // Use the original fstab carried by this matching Recovery image,
+            // not a cached installed table or a remount of any logical partition.
+            let text = fs::read_to_string("/system/etc/recovery.fstab").context("read PGZ110 Recovery fstab")?;
+            let entries = crate::reset_fstab::parse(&text).context("validate PGZ110 Recovery erase targets")?;
+            // PGZ110 lists oplusreserve2 as /cache, but OEM init can use
+            // that same partition as /rbr. It is not an independent cache.
+            // Validate its fstab row, but never format it during a reset.
+            if entries.cache.is_some() {
+                skyward_sys::kmsg("factory reset preserves OEM oplusreserve2 (shared cache/RBR)")?;
+            }
+            (entries.data, entries.metadata, None)
+        } else {
+            if let Some(slot) = skyward_vab::current_slot()? {
+                skyward_vab::mount_partitions(slot).context("restore installed fstab sources before factory reset")?;
+            }
+            (first(DATA)?, first(METADATA)?, cache()?)
+        };
+        if let Some(hold) = reset_update_hold(ramdisk_only, &metadata)? {
             return Ok(Err(Refusal::Update(hold)));
         }
-        let data = first(DATA)?;
         let rebuilt = data.extra("keydirectory").is_some() && data.extras.iter().any(|e| e == "formattable");
         if !rebuilt && reformat.is_none() {
             return Ok(Err(Refusal::NotRebuilt));
         }
-        Ok(Ok(Plan { data, cache: cache()?, metadata: first(METADATA)?, reformat }))
+        Ok(Ok(Plan { data, cache, metadata, reformat, ramdisk_only }))
     })();
     match plan {
         Ok(Ok(plan)) => Ok(plan),
@@ -212,6 +227,30 @@ fn update_hold() -> Result<Option<Hold>> {
     Ok(skyward_vab::update()?.and_then(|u| u.holds_wipe(current)))
 }
 
+fn reset_update_hold(ramdisk_only: bool, metadata: &Entry) -> Result<Option<Hold>> {
+    if !ramdisk_only { return update_hold(); }
+    let current = skyward_vab::current_slot()?.context("cannot verify update state without a booted slot")?;
+    let at = Path::new(METADATA);
+    let device = fstab::device(metadata)?;
+    let expected = skyward_block::devnum(Path::new(&device))?;
+    // /metadata is normally mounted before any logical slot partition. If
+    // absent, mount only that verified block device, never vendor or super.
+    if !mount::is_mount_point(at)? {
+        fs::create_dir_all(at)?;
+        mount::mount(Path::new(&device), at, &metadata.filesystem,
+            &["ro".into(), "nosuid".into(), "nodev".into(), "noexec".into()])
+            .context("cannot inspect updates on /metadata; refusing factory reset")?;
+    }
+    let shown = mount::visible(at)?.context("metadata mount is not visible")?;
+    ensure!(shown.device == expected && shown.filesystem == metadata.filesystem,
+        "unexpected filesystem at /metadata; refusing factory reset");
+    let update = skyward_vab::update()?.context("cannot verify update state on /metadata")?;
+    if let Some(hold) = update.holds_wipe(current) { return Ok(Some(hold)); }
+    ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None,
+        "an update snapshot is pending; refusing factory reset");
+    Ok(None)
+}
+
 impl Plan {
     /// The destructive parts, in their actual execution order.
     pub fn steps(&self) -> Vec<Step> {
@@ -222,7 +261,7 @@ impl Plan {
     /// metadata-dependent update/dual-system work must finish before keys go.
     /// Once metadata is formatted, later failure cannot restore the old keys.
     pub fn carry_out(self, keep_memtag_mode: bool, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
-        if let Some(hold) = update_hold().map_err(failed(Step::Metadata))? {
+        if let Some(hold) = reset_update_hold(self.ramdisk_only, &self.metadata).map_err(failed(Step::Metadata))? {
             return Err(Stop::Refused(Refusal::Update(hold)));
         }
         let data_fs = self.reformat.as_deref().unwrap_or(&self.data.filesystem);
@@ -232,10 +271,11 @@ impl Plan {
         validate_reset_devices(&metadata_device, &data_device, cache_device.as_deref()).map_err(failed(Step::Metadata))?;
         // Resolve and validate ALL formatters before the first mkfs. Metadata
         // and cache retain their own fstab filesystems even for a data override.
-        let metadata_format = erase::prepared(&metadata_device, &self.metadata.filesystem, &self.metadata.extras, false).map_err(failed(Step::Metadata))?;
-        let data_format = erase::prepared(&data_device, data_fs, &self.data.extras, casefolds(&self.data)).map_err(failed(Step::Data))?;
+        let prepare = if self.ramdisk_only { erase::prepared_recovery } else { erase::prepared };
+        let metadata_format = prepare(&metadata_device, &self.metadata.filesystem, &self.metadata.extras, false).map_err(failed(Step::Metadata))?;
+        let data_format = prepare(&data_device, data_fs, &self.data.extras, casefolds(&self.data)).map_err(failed(Step::Data))?;
         let cache_format = match (&self.cache, &cache_device) {
-            (Some(cache), Some(device)) => Some(erase::prepared(device, &cache.filesystem, &cache.extras, false).map_err(failed(Step::Cache))?),
+            (Some(cache), Some(device)) => Some(prepare(device, &cache.filesystem, &cache.extras, false).map_err(failed(Step::Cache))?),
             _ => None,
         };
         if mount::is_mount_point(Path::new(METADATA)).map_err(failed(Step::Metadata))? {
@@ -247,6 +287,16 @@ impl Plan {
         release_data().map_err(failed(Step::Data))?;
         if mount::is_mount_point(Path::new(METADATA)).map_err(failed(Step::Metadata))? {
             mount::umount(Path::new(METADATA)).map_err(failed(Step::Metadata))?;
+        }
+        if self.ramdisk_only {
+            // Check before touching metadata: no hidden mounts or other dm
+            // consumers of the raw device may survive the close step.
+            for (device, allowed, step) in [
+                (metadata_device.as_path(), None, Step::Metadata),
+                (data_device.as_path(), None, Step::Data),
+            ].into_iter().chain(cache_device.as_deref().map(|device| (device, Some(Path::new(CACHE)), Step::Cache))) {
+                reset_target_released(device, allowed).map_err(failed(step))?;
+            }
         }
         crate::reset_order::run(self.cache.is_some(), |part| -> Result<()> {
             let step = reset_step(part);
@@ -265,6 +315,22 @@ impl Plan {
         }
         Ok(())
     }
+}
+
+fn reset_target_released(device: &Path, allowed: Option<&Path>) -> Result<()> {
+    let number = skyward_block::devnum(device)?;
+    if let Some(at) = allowed {
+        if let Some(shown) = mount::visible(at)? {
+            ensure!(shown.device == number, "unexpected device mounted at {}", at.display());
+        }
+    }
+    let mounts = mount::points_of(number)?;
+    ensure!(mounts.len() <= 1 && mounts.iter().all(|at| Some(at.as_path()) == allowed),
+        "{} is still mounted outside the reset path: {mounts:?}", device.display());
+    let holders = format!("/sys/dev/block/{}:{}/holders", number.0, number.1);
+    ensure!(fs::read_dir(&holders).with_context(|| format!("inspect {holders}"))?.next().is_none(),
+        "{} still has a block-device holder", device.display());
+    Ok(())
 }
 
 fn reset_step(part: crate::reset_order::Part) -> Step {

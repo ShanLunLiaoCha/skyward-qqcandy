@@ -153,17 +153,18 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
         Some(other) => bail!("androidboot.vbmeta.device_state {other:?}"),
     };
     let system = SystemProps::current()?;
+    let manifest = system.pgz110_display_manifest(&cfg.device);
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
-        model: system.get(&cfg.device.model_prop).filter(|value| !value.is_empty()).unwrap_or_else(|| cfg.device.model.clone()),
+        model: system.display_property(manifest.as_deref(), &cfg.device.model_prop).unwrap_or_else(|| cfg.device.model.clone()),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
         cpu: cpu(Path::new(CPU))?,
         ram_kib: mem_total(&read("/proc/meminfo")?)?,
         panel: (d.width > 0 && d.height > 0).then_some((d.width, d.height)),
         screen: d.diagonal,
-        os_version: system.get(&cfg.device.os_version_prop),
+        os_version: system.display_property(manifest.as_deref(), &cfg.device.os_version_prop),
         android: system.get("ro.build.version.release"),
         locale: system.get("ro.product.locale"),
         security_patch: system.get("ro.build.version.security_patch").map(|s| s.parse()).transpose()?,
@@ -206,6 +207,37 @@ impl SystemProps {
             skyward_sys::kmsg(&format!("the installed system's properties could not be read, and the phone's details go without them: {}", why.unwrap_or_default()))?;
         }
         Ok(SystemProps::Installed(read.unwrap_or_default()))
+    }
+
+    fn pgz110_display_manifest(&self, device: &skyward_config::Device) -> Option<String> {
+        if !matches!(self, Self::Installed(_)) || device.codename != "OP5911"
+            || device.recovery_partition != skyward_config::RecoveryPartition::VendorBoot
+        {
+            return None;
+        }
+        // Accept only the installed booted slot's mount, not an unmounted
+        // directory or Recovery's own props. A missing manifest is optional.
+        let slot = skyward_vab::current_slot().ok().flatten()?;
+        let name = format!("my_manifest{}", slot.suffix());
+        let part = skyward_vab::mounted_partitions(slot).ok()?.into_iter().find(|m| m.partition == name)?;
+        read_opt(part.mount_point.join("build.prop")).ok().flatten()
+    }
+
+    fn display_property(&self, manifest: Option<&str>, name: &str) -> Option<String> {
+        // my_product can still advertise a different, older component release.
+        // Override only these two display fields, not the merged properties
+        // used for boot, HAL discovery, security patch, or Android release.
+        let from_manifest = match (self, manifest, name) {
+            (Self::Installed(_), Some(text), "ro.product.name" | "ro.build.display.ota") => text.lines()
+                .filter_map(|line| line.split_once('='))
+                .filter(|(key, _)| key.trim() == name)
+                .map(|(_, value)| value.trim())
+                .last()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        };
+        from_manifest.or_else(|| self.get(name).filter(|value| !value.trim().is_empty()))
     }
 
     fn get(&self, name: &str) -> Option<String> {
@@ -407,7 +439,21 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
         .or_else(|| oplus_design.and_then(|mah| mah.checked_mul(1000)));
     let full = positive(parse_opt(dir.join("charge_full"), "charge_full")?);
     let voltage = positive(parse_opt::<u64>(dir.join("voltage_now"), "voltage_now")?);
-    let voltage = if oplus_facade { voltage.and_then(|mv| mv.checked_mul(1000)) } else { voltage };
+    let voltage = if oplus_facade {
+        voltage.and_then(|mv| mv.checked_mul(1000))
+    } else if dir.file_name().is_some_and(|name| name == "battery") && voltage.is_some_and(|mv| (2000..=6000).contains(&mv)) {
+        // Older PGZ110 exposes the same milliVolt facade but has no
+        // design_capacity marker. Require independent corroboration, then
+        // display the gauge's native microVolt reading (not the facade).
+        let gauge = root.join("mtk-battery");
+        let corroborated = (|| -> Result<Option<u64>> {
+            if read_opt(gauge.join("type"))?.as_deref() != Some("Battery") { return Ok(None); }
+            Ok(parse_opt::<u64>(gauge.join("voltage_now"), "MTK gauge voltage")?
+                .filter(|uv| (2_000_000..=6_000_000).contains(uv)
+                    && voltage.is_some_and(|mv| (mv * 1000).abs_diff(*uv) <= 200_000)))
+        })().ok().flatten();
+        corroborated.or(voltage)
+    } else { voltage };
     Ok(Some(Battery {
         level: parse(&read(dir.join("capacity"))?, "capacity")?,
         charge,
@@ -466,6 +512,30 @@ mod tests {
         assert_eq!(system.get(&cfg.device.os_version_prop).as_deref(),Some("installed OTA label"));
     }
     #[test]
+    fn pgz110_a16_display_uses_manifest_not_component_or_ramdisk_labels() {
+        let system = SystemProps::Installed(HashMap::from([
+            ("ro.product.name".into(), "ossi".into()),
+            ("ro.build.display.ota".into(), "PGZ110_11_A.01".into()),
+            ("ro.build.version.release".into(), "12".into()),
+        ]));
+        let manifest = Some("# ro.product.name=comment\nro.product.name=PGZ110\nro.build.display.ota=PGZ110_11_A.16\nro.build.version.release=99\n");
+        assert_eq!(system.display_property(manifest, "ro.product.name").as_deref(), Some("PGZ110"));
+        assert_eq!(system.display_property(manifest, "ro.build.display.ota").as_deref(), Some("PGZ110_11_A.16"));
+        assert_eq!(system.display_property(manifest, "ro.build.version.release").as_deref(), Some("12"));
+        assert_eq!(system.get("ro.build.display.ota").as_deref(), Some("PGZ110_11_A.01"));
+    }
+
+    #[test]
+    fn pgz110_display_keeps_existing_values_if_manifest_has_no_override() {
+        let system = SystemProps::Installed(HashMap::from([
+            ("ro.product.name".into(), "一加 Ace 竞速版".into()),
+            ("ro.build.display.ota".into(), "PGZ110_15.0.0.1600(CN01)".into()),
+        ]));
+        assert_eq!(system.display_property(None, "ro.product.name").as_deref(), Some("一加 Ace 竞速版"));
+        assert_eq!(system.display_property(Some("ro.build.display.ota=  \n"), "ro.build.display.ota").as_deref(), Some("PGZ110_15.0.0.1600(CN01)"));
+    }
+
+    #[test]
     fn cpulist_ranges_and_singles() {
         assert_eq!(cpulist("0-7").unwrap(), (0..8).collect::<Vec<_>>());
         assert_eq!(cpulist("0-3,6,8-9").unwrap(), vec![0, 1, 2, 3, 6, 8, 9]);
@@ -508,6 +578,27 @@ mod tests {
         fs::write(vendor.join("design_capacity"),"4873").unwrap();assert_eq!(battery(&supplies).unwrap().unwrap().design,Some(4_873_000));
         fs::write(bat.join("charge_full_design"),"4900000").unwrap();assert_eq!(battery(&supplies).unwrap().unwrap().design,Some(4_900_000));
     }
+    #[test]
+    fn a16_uses_corroborating_mtk_gauge_without_design_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let supplies = dir.path().join("power_supply");
+        let bat = supplies.join("battery");
+        let gauge = supplies.join("mtk-battery");
+        fs::create_dir_all(&bat).unwrap();
+        fs::create_dir_all(&gauge).unwrap();
+        for (file, value) in [("type", "Battery"), ("status", "Charging"), ("capacity", "50"), ("voltage_now", "4370")] {
+            fs::write(bat.join(file), value).unwrap();
+        }
+        fs::write(gauge.join("type"), "Battery").unwrap();
+        fs::write(gauge.join("voltage_now"), "4368000").unwrap();
+        assert_eq!(battery(&supplies).unwrap().unwrap().voltage, Some(4_368_000));
+        fs::write(gauge.join("voltage_now"), "2500000").unwrap();
+        assert_eq!(battery(&supplies).unwrap().unwrap().voltage, Some(4370));
+        fs::write(bat.join("voltage_now"), "4291000").unwrap();
+        fs::write(gauge.join("voltage_now"), "4368000").unwrap();
+        assert_eq!(battery(&supplies).unwrap().unwrap().voltage, Some(4_291_000));
+    }
+
     #[test]
     fn a_battery_charged_quickly_says_so_beside_the_power_supplies() {
         // The 17 Ultra's in the recovery, on a charger it charges slowly on.

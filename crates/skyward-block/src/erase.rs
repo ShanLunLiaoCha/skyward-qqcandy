@@ -87,6 +87,15 @@ impl PreparedFormat {
 /// This validates supported arguments in our formatter contract, not whether
 /// a particular vendor executable will succeed when actually invoked.
 pub fn prepared(device: &Path, filesystem: &str, extras: &[String], casefold: bool) -> Result<PreparedFormat> {
+    prepare_with(device, filesystem, extras, casefold, false)
+}
+
+/// Prepare a format without requiring any of the installed-system mounts.
+pub fn prepared_recovery(device: &Path, filesystem: &str, extras: &[String], casefold: bool) -> Result<PreparedFormat> {
+    prepare_with(device, filesystem, extras, casefold, true)
+}
+
+fn prepare_with(device: &Path, filesystem: &str, extras: &[String], casefold: bool, ramdisk_only: bool) -> Result<PreparedFormat> {
     use std::os::unix::fs::PermissionsExt;
     let (program, mut args) = command(device, filesystem, extras, casefold, page_size())?;
     args.push(tools::path(device)?);
@@ -95,7 +104,7 @@ pub fn prepared(device: &Path, filesystem: &str, extras: &[String], casefold: bo
         // takes as just as large.
         args.push((length / BLOCK).to_string());
     }
-    let tool = tools::find(program)?;
+    let tool = if ramdisk_only { tools::recovery_only(program)? } else { tools::find(program)? };
     let metadata = std::fs::metadata(&tool.program).context("stat filesystem formatter")?;
     ensure!(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0, "filesystem formatter is not executable: {}", tool.program.display());
     let size = crate::size_bytes(device)?;

@@ -68,6 +68,15 @@ pub fn find(name: &str) -> Result<Tool, Missing> {
     look(name, Path::new(BIN), Path::new(SYSTEM_BIN))
 }
 
+/// Use only the formatter shipped in Recovery, never one on an installed slot.
+pub(crate) fn recovery_only(name: &str) -> Result<Tool> {
+    let program = Path::new(BIN).join(name);
+    let metadata = std::fs::symlink_metadata(&program)
+        .with_context(|| format!("Recovery formatter {} is required", program.display()))?;
+    anyhow::ensure!(metadata.is_file(), "Recovery formatter {} is not a regular file", program.display());
+    Ok(Tool { program, libraries: Vec::new() })
+}
+
 fn look(name: &str, bin: &Path, system_bin: &Path) -> Result<Tool, Missing> {
     let own = bin.join(name);
     if own.exists() {

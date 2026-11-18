@@ -29,7 +29,7 @@ Existing handover notes report successful compilation and host tests, and earlie
 - Unlocking, flashing, decryption and formatting can cause permanent data loss or an unbootable device. Keep independent backups and the matching stock firmware/recovery path.
 - Do not use upstream Xiaomi `fastboot flash recovery` instructions on this phone. No generic flashing command is supplied here: verify the firmware, partition layout, slot and recovery method first.
 - Stock init, filesystem checks and Trustonic services may write to persistent storage. Recovery and diagnostic modes are **not read-only**.
-- “All data” follows the port's close-data → format-metadata → format-data policy. Formatting metadata destroys encryption keys and cannot be undone.
+- In the current source, “All data” closes data, then formats metadata and data, while preserving the PGZ110 shared OEM cache/RBR partition (`oplusreserve2`). Formatting metadata destroys encryption keys and cannot be undone. This source change is not a claim about the previously published image.
 - Debug image tools enable root/debug services and use an explicitly supplied ADB public key. Do not ship a personal key, raw device logs, Wi-Fi credentials or a debug image as a secure production build.
 - Xiaomi-specific online update behavior inherited from upstream is not a supported update channel for this OnePlus port.
 

@@ -1256,6 +1256,7 @@ impl<'a> Pages<'a> {
         // The wipe page offers the cache partition where the phone's table has
         // one; a table that does not read leaves it out, and the page still
         // works.
+        app.state.reset_preserves_oem_cache = wipe::preserves_oem_cache(cfg);
         app.state.cache_partition = match wipe::cache() {
             Ok(cache) => cache.is_some(),
             Err(e) => {
@@ -2912,15 +2913,14 @@ impl Pages<'_> {
         if name == DATA_PARTITION && !withhold(&mut self.transfer, &mut self.app, now)? {
             return Ok(());
         }
-        let part = fs_part(name)?;
         let (kind, task) = match action {
             FsAction::Remake(filesystem) if name == DATA_PARTITION => {
                 self.erase_leaves = false;
                 self.eraser = Some(factory_reset(&mut self.app, false, false, Some(filesystem))?);
                 return Ok(());
             }
-            FsAction::Repair => (PartKind::Repair, partwork::Task::Repair(part)),
-            FsAction::Remake(filesystem) => (PartKind::Remake(filesystem.clone()), partwork::Task::Remake(part, filesystem)),
+            FsAction::Repair => (PartKind::Repair, partwork::Task::Repair(fs_part(name)?)),
+            FsAction::Remake(filesystem) => (PartKind::Remake(filesystem.clone()), partwork::Task::Remake(fs_part(name)?, filesystem)),
         };
         skyward_sys::kmsg(&format!("{kind:?} the filesystem of {name}, as the filesystem page asked"))?;
         self.app.part_work_started(kind, false);

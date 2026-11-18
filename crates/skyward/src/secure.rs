@@ -90,7 +90,7 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // installed system's programs are loaded by the installed system's
     // loader rather than by the older one a recovery carries.
     let loader = Path::new(EARLY_LOADER);
-    let from = bundle(RUNTIME_BUNDLE)?
+    let from = bundle(RUNTIME_BUNDLE, false)?
         .map(|at| at.join(BUNDLE_LOADER))
         .filter(|p| p.is_file())
         .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
@@ -160,21 +160,30 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
 /// need no bundle has none to open.
 pub fn libraries() -> Result<Option<PathBuf>> {
     let Some(version) = skyward_sys::prop(VENDOR_INTERFACE) else { return Ok(None) };
-    Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
+    ensure!(!version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+        "{VENDOR_INTERFACE} is not a numeric VNDK version");
+    Ok(bundle(&format!("com.android.vndk.v{version}"), true)?.map(|at| at.join(BUNDLE_LIBS)))
 }
 
 /// Open the bundle of this name where it lies, and give where it is. A
 /// bundle the phone does not carry gives nothing; one already open is left
 /// as it is.
-fn bundle(name: &str) -> Result<Option<PathBuf>> {
+fn bundle(name: &str, vndk: bool) -> Result<Option<PathBuf>> {
+    // Serialize the check/stage/mount operation so callers cannot stack two
+    // mounts or allocate two loops for the same already-opening bundle.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().map_err(|_| anyhow::anyhow!("library bundle preparation lock poisoned"))?;
     let at = Path::new(BUNDLE_MOUNT).join(name);
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = crate::bundle_paths::find(name, BUNDLE_DIRS) else {
-        return Ok(None);
+    let selected = if vndk {
+        crate::bundle_paths::find_vndk(name)?
+    } else {
+        crate::bundle_paths::find(name, BUNDLE_DIRS).map(|file| (file, false))
     };
-    let (offset, length) = image(&file)?;
+    let Some((file, from_current)) = selected else { return Ok(None) };
+    let (offset, length) = image(&file, from_current.then_some(name))?;
     skyward_sys::kmsg(&format!("opening installed library bundle {} from {}", name, file.display()))?;
     // The kernel loop holds its backing file even after every HAL stops.
     // Stage exact payload bytes in tmpfs first so installation can release
@@ -202,9 +211,21 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Where the filesystem lies inside a bundle.
-fn image(file: &Path) -> Result<(u64, u64)> {
+fn image(file: &Path, expected_manifest_name: Option<&str>) -> Result<(u64, u64)> {
+    use std::io::Read;
     let f = fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
     let mut bundle = zip::ZipArchive::new(f).with_context(|| format!("read what is in {}", file.display()))?;
+    if let Some(expected) = expected_manifest_name {
+        let limit = crate::bundle_paths::MANIFEST_LIMIT as u64;
+        let manifest = bundle.by_name("apex_manifest.pb").context("current VNDK has no apex_manifest.pb")?;
+        let size = manifest.size();
+        ensure!(size <= limit, "current VNDK apex_manifest.pb exceeds {limit} bytes");
+        let mut bytes = Vec::with_capacity(size as usize);
+        manifest.take(limit + 1).read_to_end(&mut bytes).context("read complete current VNDK apex_manifest.pb")?;
+        ensure!(bytes.len() as u64 == size, "current VNDK manifest length does not match its archive entry");
+        crate::bundle_paths::verify_manifest_name(&bytes, expected)
+            .with_context(|| format!("refusing VNDK fallback {}", file.display()))?;
+    }
     let entry = bundle.by_name(BUNDLE_IMAGE).with_context(|| format!("{} holds no {BUNDLE_IMAGE}", file.display()))?;
     if entry.compression() != zip::CompressionMethod::Stored {
         anyhow::bail!("{} keeps its {BUNDLE_IMAGE} packed, which cannot be opened where it lies", file.display());

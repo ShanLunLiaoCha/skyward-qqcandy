@@ -44,6 +44,12 @@ pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTE
 /// own files read only once that user's key is let in.
 #[cfg(target_os = "android")]
 pub fn unlocked(dir: &Path) -> Result<bool> {
+    Ok(policy_key_present(dir)?.unwrap_or(true))
+}
+
+/// `None` means the directory has no encryption policy.
+#[cfg(target_os = "android")]
+pub(crate) fn policy_key_present(dir: &Path) -> Result<Option<bool>> {
     use std::os::fd::AsRawFd;
     const GET_POLICY: u32 = 0xc009_6616;
     const GET_KEY_STATUS: u32 = 0xc080_661a;
@@ -61,7 +67,7 @@ pub fn unlocked(dir: &Path) -> Result<bool> {
     if unsafe { libc::ioctl(folder.as_raw_fd(), GET_POLICY as libc::Ioctl, policy.as_mut_ptr()) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::ENODATA) {
-            return Ok(true);
+            return Ok(None);
         }
         return Err(e).with_context(|| format!("read how {} is encrypted", dir.display()));
     }
@@ -80,7 +86,7 @@ pub fn unlocked(dir: &Path) -> Result<bool> {
     if unsafe { libc::ioctl(folder.as_raw_fd(), GET_KEY_STATUS as libc::Ioctl, status.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("ask whether the key for {} is in", dir.display()));
     }
-    Ok(u32::from_ne_bytes(status[64..68].try_into().expect("four bytes")) == PRESENT)
+    Ok(Some(u32::from_ne_bytes(status[64..68].try_into().expect("four bytes")) == PRESENT))
 }
 
 /// Whether what a phone says about how it encrypts its files means the

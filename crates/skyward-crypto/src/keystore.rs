@@ -64,22 +64,52 @@ pub struct StoredKey {
 
 impl StoredKey {
     pub fn load(dir: &Path) -> Result<StoredKey> {
+        Self::load_for(dir, false, false)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn load_hardware(dir: &Path) -> Result<StoredKey> {
+        Self::load_for(dir, true, false)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn load_legacy_hardware(dir: &Path) -> Result<StoredKey> {
+        Self::load_for(dir, true, true)
+    }
+
+    fn load_for(dir: &Path, hardware: bool, require_legacy: bool) -> Result<StoredKey> {
         let read = |name: &str| fs::read(dir.join(name)).with_context(|| format!("read {}", dir.join(name).display()));
         let version = fs::read_to_string(dir.join(FN_VERSION)).with_context(|| format!("read {}", dir.join(FN_VERSION).display()))?;
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
-        }
+        let stretching = dir.join(FN_STRETCHING);
+        let legacy = match fs::symlink_metadata(&stretching) {
+            Ok(metadata) => {
+                if !hardware || !metadata.is_file() || metadata.len() != 10 || read(FN_STRETCHING)? != b"nopassword" {
+                    bail!("{} was written by an Android too old for Skyward to read", dir.display());
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", stretching.display())),
+        };
+        anyhow::ensure!(!require_legacy || legacy, "legacy CE key requires the nopassword marker");
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
-            true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
+            true => {
+                let bytes = read(FN_SECDISCARDABLE)?;
+                anyhow::ensure!(!legacy || !bytes.is_empty(), "legacy secdiscardable is empty");
+                hash_with_prefix(SECDISCARDABLE_PREFIX, &bytes)
+            }
             false => Vec::new(),
         };
         let key_blob = match dir.join(FN_KEY_BLOB).exists() {
             true => Some(read(FN_KEY_BLOB)?),
             false => None,
         };
+        if legacy && (secdiscardable_hash.is_empty() || key_blob.as_ref().is_none_or(Vec::is_empty)) {
+            bail!("{} lacks the hardware blob or secdiscardable for a legacy nopassword key", dir.display());
+        }
         Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })
     }
 
@@ -231,6 +261,31 @@ mod tests {
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));
+    }
+
+    #[test]
+    fn legacy_nopassword_requires_hardware_and_preserves_binding() {
+        struct Hardware;
+        impl Decryptor for Hardware {
+            fn gcm_decrypt(&self, blob: &[u8], id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+                assert_eq!(blob, b"test blob");
+                assert_eq!(id, hash_with_prefix(SECDISCARDABLE_PREFIX, b"directory binding"));
+                assert_eq!(nonce, [7; NONCE_BYTES]);
+                assert_eq!(body, &[7; TAG_BYTES + KEY_BYTES]);
+                Ok(vec![42; KEY_BYTES])
+            }
+        }
+        let dir = tempdir("legacy-nopassword");
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_STRETCHING), "nopassword").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), [7; NONCE_BYTES + TAG_BYTES + KEY_BYTES]).unwrap();
+        fs::write(dir.join(FN_KEY_BLOB), b"test blob").unwrap();
+        assert!(StoredKey::load(&dir).is_err());
+        assert!(StoredKey::load_for(&dir, true, true).is_err());
+        fs::write(dir.join(FN_SECDISCARDABLE), b"directory binding").unwrap();
+        assert_eq!(StoredKey::load_for(&dir, true, true).unwrap().unwrap(Unwrap::Hardware(&Hardware)).unwrap(), vec![42; KEY_BYTES]);
+        fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
+        assert!(StoredKey::load_for(&dir, true, true).is_err());
     }
 
     #[test]

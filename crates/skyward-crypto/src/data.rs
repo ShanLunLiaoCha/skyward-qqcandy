@@ -45,7 +45,7 @@ pub fn storage_key(service: &KeyMint, entry: &Entry, encryption: &Encryption) ->
 /// this start of the phone. A key the hardware holds never appears as
 /// itself: what comes back is wrapped again, for this start only.
 fn hardware_key(service: &KeyMint, dir: &Path, wrapped: bool) -> Result<Vec<u8>> {
-    let stored = StoredKey::load(dir).with_context(|| format!("read the key in {}", dir.display()))?;
+    let stored = StoredKey::load_hardware(dir).with_context(|| format!("read the key in {}", dir.display()))?;
     let key = stored.unwrap(Unwrap::Hardware(service)).with_context(|| format!("unwrap the key in {}", dir.display()))?;
     match wrapped {
         true => service.ephemeral_storage_key(&key).with_context(|| format!("make the key in {} usable now", dir.display())),
@@ -186,6 +186,9 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
+        if user == OWNER && open_legacy_owner_without_lock(service)? {
+            continue;
+        }
         let protector = protector(user)?;
         match protector.lock {
             None => {
@@ -198,6 +201,59 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         }
     }
     Ok(Opening { mounted, closed: open_made_up(service, closed, &owner) })
+}
+
+/// A.16 can store owner CE directly under vold's credential-free hardware
+/// wrapping when Android has never set up a screen credential. Absence of an
+/// SP directory alone is not sufficient to select this path.
+fn open_legacy_owner_without_lock(service: &KeyMint) -> Result<bool> {
+    use std::io::ErrorKind;
+    if skyward_sys::prop("ro.build.version.release").as_deref() != Some("12") {
+        return Ok(false);
+    }
+    let model = std::fs::read_to_string("/my_manifest/build.prop").unwrap_or_default();
+    if !model.lines().any(|line| line.trim() == "ro.product.name=PGZ110") { return Ok(false); }
+    let absent = |path: &Path| -> Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e).with_context(|| format!("inspect {}", path.display())),
+        }
+    };
+    let sp = blobs(OWNER);
+    let de = sp.parent().context("owner SP path has no parent")?;
+    if !absent(&sp)? || !de.is_dir() || crate::fscrypt::policy_key_present(de)? != Some(true) {
+        return Ok(false);
+    }
+    for root in ["/data/system", "/data/system/users/0"] {
+        for name in ["gatekeeper.password.key", "gatekeeper.pattern.key", "gatekeeper.gesture.key", "password.key", "gesture.key", "gatekeeper.profile.key"] {
+            if !absent(&Path::new(root).join(name))? { return Ok(false); }
+        }
+    }
+    let database = Path::new(crate::locksettings::DATABASE);
+    if absent(database)? || !crate::locksettings::legacy_owner_has_no_lock(database)? { return Ok(false); }
+
+    let dir = Path::new(USER_KEYS).join("ce/0/current");
+    anyhow::ensure!(std::fs::symlink_metadata(&dir)?.is_dir(), "unexpected legacy owner CE key directory");
+    let media = Path::new(SHARED_STORAGE).join("0");
+    let system_ce = Path::new("/data/system_ce/0");
+    for path in [media.as_path(), system_ce] {
+        anyhow::ensure!(std::fs::symlink_metadata(path)?.is_dir() && crate::fscrypt::policy_key_present(path)?.is_some(),
+            "legacy owner storage has no verified encryption policy at {}", path.display());
+    }
+    let stored = StoredKey::load_legacy_hardware(&dir).context("read legacy owner CE hardware key")?;
+    let mut raw = stored.unwrap(Unwrap::Hardware(service)).context("KeyMint unwrap of legacy owner CE key")?;
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    if wrapped { raw = service.ephemeral_storage_key(&raw).context("make legacy owner CE key usable now")?; }
+    crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
+    for path in [media.as_path(), system_ce] {
+        anyhow::ensure!(crate::fscrypt::policy_key_present(path)? == Some(true),
+            "legacy owner CE key did not unlock {}", path.display());
+    }
+    show_owner_storage()?;
+    skyward_sys::kmsg("legacy PGZ110 owner storage opened through KeyMint and verified by fscrypt")?;
+    Ok(true)
 }
 
 /// Open the own files of `user` with what they typed at their screen lock

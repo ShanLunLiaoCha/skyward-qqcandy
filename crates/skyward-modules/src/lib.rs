@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod modprobe;
+mod wlan_plan;
+pub use wlan_plan::{WlanModulePlan, plan_wlan};
 
 /// Where a module source's files are in the recovery: the vendor_boot
 /// ramdisk's modules under /lib/modules, the vendor_dlkm and vendor

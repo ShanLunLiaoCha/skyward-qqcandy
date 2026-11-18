@@ -8,7 +8,7 @@ use crate::phone::{Happens, Phone};
 use crate::script::{Program, Socket};
 use anyhow::{bail, ensure, Context, Result};
 use skyward_config::Service;
-use std::path::Path;
+use std::{fs, io::{ErrorKind, Read, Seek, SeekFrom}, path::Path};
 
 /// The key service, and the packages whose services it serves besides: it
 /// is one program behind them all.
@@ -69,6 +69,79 @@ const OPENERS: [&str; 2] = ["ssgtzd", "hlosminkdaemon"];
 /// knows it under, and the property it sets once it takes calls.
 const HARDWARE_DIRECTORY: &str = "hwservicemanager";
 const HARDWARE_DIRECTORY_READY: &str = "hwservicemanager.ready";
+
+const LEGACY_DIRECTORY_RC: &str = "etc/init/hwservicemanager.rc";
+const LEGACY_DIRECTORY_BIN: &str = "bin/hwservicemanager";
+
+fn hardware_directory(phone: &Phone, system: Option<&Path>) -> Result<Option<Started>> {
+    let directories = || phone.programs.iter().filter(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p));
+    if let Some(program) = directories().find(|p| p.path == "/system_ext/bin/hwservicemanager").or_else(|| directories().next()) {
+        return Ok(Some(started(phone, program, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new())));
+    }
+    let Some(system) = system else { return Ok(None) };
+    let rc = system.join(LEGACY_DIRECTORY_RC);
+    let rc_metadata = match fs::symlink_metadata(&rc) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", rc.display())),
+    };
+    ensure!(rc_metadata.is_file() && rc_metadata.len() <= 8192, "unexpected legacy HIDL directory RC at {}", rc.display());
+    let text = fs::read_to_string(&rc).with_context(|| format!("read {}", rc.display()))?;
+    let script = crate::script::read(&text).with_context(|| format!("parse {}", rc.display()))?;
+    let [program] = script.programs.as_slice() else { bail!("legacy HIDL RC must declare exactly one service") };
+    ensure!(script.imports.is_empty() && script.actions.is_empty()
+        && program.name == HARDWARE_DIRECTORY && program.path == "/system/bin/hwservicemanager"
+        && program.args.is_empty() && program.user.as_deref() == Some("system")
+        && program.groups == ["system", "readproc"] && program.capabilities.is_none()
+        && program.sockets.is_empty() && program.environment.is_empty() && program.interfaces.is_empty()
+        && !program.oneshot && !program.overrides,
+        "unexpected service in legacy HIDL directory RC at {}", rc.display());
+    let binary = system.join(LEGACY_DIRECTORY_BIN);
+    let metadata = fs::symlink_metadata(&binary).with_context(|| format!("stat {}", binary.display()))?;
+    ensure!(metadata.is_file(), "legacy HIDL directory executable must be a regular file: {}", binary.display());
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(metadata.permissions().mode() & 0o111 != 0, "legacy HIDL directory is not executable: {}", binary.display());
+    }
+    legacy_interpreter(&mut fs::File::open(&binary)?).with_context(|| format!("check interpreter of {}", binary.display()))?;
+    let mut manager = started(phone, program, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new());
+    manager.service.path = binary.to_str().context("legacy HIDL executable path is not UTF-8")?.to_owned();
+    Ok(Some(manager))
+}
+
+/// Match only the native loaders already provided by the Recovery ramdisk or
+/// by prepare_hardware_directory (which mounts runtime and exposes bootstrap).
+pub fn legacy_interpreter(file: &mut (impl Read + Seek)) -> Result<&'static str> {
+    let mut header = [0; 64];
+    file.read_exact(&mut header)?;
+    ensure!(&header[..7] == b"\x7fELF\x02\x01\x01" && header[18..20] == 183u16.to_le_bytes(), "expected AArch64 ELF64");
+    let phoff = u64::from_le_bytes(header[32..40].try_into()?);
+    let entsize = u16::from_le_bytes(header[54..56].try_into()?);
+    let count = u16::from_le_bytes(header[56..58].try_into()?);
+    ensure!(entsize == 56 && (1..=128).contains(&count), "unexpected ELF program headers");
+    let mut selected = None;
+    for index in 0..count {
+        let at = phoff.checked_add(u64::from(index) * 56).context("program header offset overflow")?;
+        file.seek(SeekFrom::Start(at))?;
+        let mut ph = [0; 56];
+        file.read_exact(&mut ph)?;
+        if u32::from_le_bytes(ph[..4].try_into()?) != 3 { continue; }
+        ensure!(selected.is_none(), "multiple ELF interpreters");
+        let offset = u64::from_le_bytes(ph[8..16].try_into()?);
+        let length = u64::from_le_bytes(ph[32..40].try_into()?);
+        ensure!((2..=128).contains(&length), "invalid ELF interpreter length");
+        file.seek(SeekFrom::Start(offset))?;
+        let mut interp = [0; 128];
+        file.read_exact(&mut interp[..length as usize])?;
+        selected = Some(match &interp[..length as usize] {
+            b"/system/bin/linker64\0" => "/system/bin/linker64",
+            b"/system/bin/bootstrap/linker64\0" => "/system/bin/bootstrap/linker64",
+            b"/apex/com.android.runtime/bin/linker64\0" => "/apex/com.android.runtime/bin/linker64",
+            _ => bail!("unsupported legacy HIDL ELF interpreter"),
+        });
+    }
+    selected.context("legacy HIDL executable has no ELF interpreter")
+}
 
 /// The folders a program's libraries are looked for in, by the partition
 /// the program is on: the recovery's own come before the vendor
@@ -150,6 +223,12 @@ enum Ready {
 /// through, serving Android's secure element service where that is what it
 /// goes through, and the weaver; and start the boot control.
 pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
+    steps_with_system(phone, None)
+}
+
+/// Optionally inspect one legacy manager declaration under the installed
+/// `system` directory. Never add this directory to Phone's init scan.
+pub fn steps_with_system(phone: &Phone, system: Option<&Path>) -> Result<Vec<Step>> {
     let mut out = Vec::new();
     let start = |out: &mut Vec<Step>, started: Started| out.push(Step::Start(Box::new(started)));
     if let Some(listeners) = named(phone, LISTENERS)? {
@@ -169,12 +248,9 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
     let (credentials, credentials_kind) = offered(phone, CREDENTIALS).context("the phone describes no credential service")?;
     let (boot, boot_kind) = offered(phone, BOOT).context("the phone describes no boot control")?;
     if credentials_kind == Kind::Hidl || boot_kind == Kind::Hidl {
-        let directory = phone
-            .programs
-            .iter()
-            .find(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p))
+        let directory = hardware_directory(phone, system)?
             .context("the phone has hardware services of the older kind, and no directory for them among the programs its scripts name")?;
-        start(&mut out, started(phone, directory, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new()));
+        start(&mut out, directory);
     }
     let ready = |name: String, kind: Kind| match kind {
         Kind::Aidl => Ready::Service(name),
@@ -399,4 +475,70 @@ fn started(phone: &Phone, program: &Program, ready: Ready, registers: Vec<String
         capabilities: program.capabilities.clone().unwrap_or_default(),
     };
     Started { service, sockets: program.sockets.clone(), environment: program.environment.clone(), anew: false }
+}
+
+#[cfg(all(test, unix))]
+mod legacy_tests {
+    use super::*;
+    use crate::phone::Partition;
+    use std::os::unix::fs::PermissionsExt;
+
+    const RC: &str = "service hwservicemanager /system/bin/hwservicemanager\n    user system\n    disabled\n    group system readproc\n    critical\n    onrestart setprop hwservicemanager.ready false\n    onrestart class_restart main\n    onrestart class_restart hal\n    onrestart class_restart early_hal\n    task_profiles ServiceCapacityLow HighPerformance\n    class animation\n    shutdown critical\n";
+
+    fn fixture(root: &Path, interp: &[u8]) {
+        let rc = root.join(LEGACY_DIRECTORY_RC);
+        fs::create_dir_all(rc.parent().unwrap()).unwrap();
+        fs::write(rc, RC).unwrap();
+        fs::write(root.join("etc/init/irrelevant.rc"), "this file must never be read\n").unwrap();
+        let bin = root.join(LEGACY_DIRECTORY_BIN);
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        let mut elf = vec![0; 120];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&3u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&120u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+        elf.extend_from_slice(interp);
+        fs::write(&bin, elf).unwrap();
+        fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn reads_only_the_legacy_rc_and_starts_installed_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), b"/system/bin/bootstrap/linker64\0");
+        let phone = Phone::read(Vec::new(), Default::default(), None).unwrap();
+        assert!(hardware_directory(&phone, None).unwrap().is_none());
+        let manager = hardware_directory(&phone, Some(dir.path())).unwrap().unwrap();
+        assert_eq!(Path::new(&manager.service.path), dir.path().join(LEGACY_DIRECTORY_BIN));
+        assert_eq!(manager.service.ready_property.as_deref(), Some(HARDWARE_DIRECTORY_READY));
+        assert_eq!(manager.service.user.as_deref(), Some("system"));
+        assert_eq!(manager.service.libraries, SYSTEM_LIBRARIES);
+        assert!(phone.programs.is_empty());
+    }
+
+    #[test]
+    fn prefers_existing_system_ext_directory_without_reading_legacy_rc() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), b"/unsupported/linker64\0");
+        fs::write(dir.path().join("etc/init/irrelevant.rc"), "# Empty system_ext fixture\n").unwrap();
+        fs::write(dir.path().join(LEGACY_DIRECTORY_RC), RC.replace("/system/bin/", "/system_ext/bin/")).unwrap();
+        let phone = Phone::read(vec![Partition::mounted("system_ext", dir.path())], Default::default(), None).unwrap();
+        let manager = hardware_directory(&phone, Some(dir.path())).unwrap().unwrap();
+        assert_eq!(Path::new(&manager.service.path), dir.path().join(LEGACY_DIRECTORY_BIN));
+    }
+
+    #[test]
+    fn rejects_unsupported_interpreter_or_additional_service() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), b"/unsupported/linker64\0");
+        let phone = Phone::read(Vec::new(), Default::default(), None).unwrap();
+        assert!(hardware_directory(&phone, Some(dir.path())).is_err());
+        fixture(dir.path(), b"/system/bin/linker64\0");
+        fs::write(dir.path().join(LEGACY_DIRECTORY_RC), format!("{RC}service unrelated /system/bin/other\n")).unwrap();
+        assert!(hardware_directory(&phone, Some(dir.path())).is_err());
+    }
 }

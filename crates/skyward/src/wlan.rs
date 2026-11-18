@@ -682,17 +682,35 @@ fn bring_up(cfg: &Config, modules: &[PathBuf], libraries: Option<&Path>) -> Resu
                 ensure!(!Path::new("/sys/module").join(name).exists(), "joint calibration participant {module} was already loaded before RAM calibration; restart Recovery cleanly, do not reset calibration");
             }
         }
+        // This profile spans two hardware barriers (connectivity bootstrap
+        // and Wi-Fi NVRAM before BT calibration). Select one compatible source
+        // for all three stages while it is still safe to reject a candidate.
+        // Other device profiles continue to use their existing module rules.
+        let planned = if cfg.bootstrap.as_ref().is_some_and(|b| b.program == "/vendor/bin/conninfra_loader")
+            && cfg.power.as_ref().is_some_and(|p| p.path == "/dev/wmtWifi")
+            && cfg.modules.iter().any(|name| name == "wlan_drv_gen4m_6895")
+        {
+            let release = fs::read_to_string("/proc/sys/kernel/osrelease").context("read running WLAN kernel release")?;
+            let bootstrap = &cfg.bootstrap.as_ref().expect("checked bootstrap profile").modules;
+            let plan = skyward_modules::plan_wlan(modules, release.trim(), &[bootstrap, &cfg.modules, &cfg.calibration_modules])?;
+            skyward_sys::kmsg(&format!("WLAN selected module tree {} for kernel {}", plan.source().display(), release.trim()))?;
+            Some(plan)
+        } else { None };
+        let load = |stage, names: &[String]| match &planned {
+            Some(plan) => plan.load_stage(stage),
+            None => skyward_modules::load(modules, names),
+        };
         // Connectivity bootstrap can request firmware too, before WLAN loads.
         for file in &cfg.firmware { place(file)?; }
         if let Some(bootstrap) = &cfg.bootstrap {
-            for path in skyward_modules::load(modules, &bootstrap.modules)? {
+            for path in load(0, &bootstrap.modules)? {
                 skyward_sys::kmsg(&format!("loaded WLAN bootstrap {}", path.display()))?;
             }
             if skyward_sys::prop(&bootstrap.ready_property).as_deref() != Some(bootstrap.ready_value.as_str()) {
                 run_bootstrap(bootstrap, libraries)?;
             }
         }
-        for path in skyward_modules::load(modules, &cfg.modules)? {
+        for path in load(1, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
         if let Some(nvram) = &cfg.nvram {
@@ -702,7 +720,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf], libraries: Option<&Path>) -> Resu
             }
         }
         if !cfg.calibration_modules.is_empty() {
-            for path in skyward_modules::load(modules, &cfg.calibration_modules)? {
+            for path in load(2, &cfg.calibration_modules)? {
                 skyward_sys::kmsg(&format!("loaded joint-calibration participant {}", path.display()))?;
             }
         }

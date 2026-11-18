@@ -30,6 +30,8 @@ pub struct State {
     pub wipe: [bool; WIPES.len()],
     /// The phone has a cache partition, which the wipe page then offers.
     pub cache_partition: bool,
+    /// This device's cache alias also serves an OEM partition; factory reset leaves it alone.
+    pub reset_preserves_oem_cache: bool,
     /// How many folders of its own the phone keeps logs in on the data
     /// partition, which erasing the logs takes in.
     pub phone_logs: usize,
@@ -199,6 +201,7 @@ impl Default for State {
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
+            reset_preserves_oem_cache: false,
             phone_logs: 0,
             pattern: Vec::new(),
             confirm: 0.0,

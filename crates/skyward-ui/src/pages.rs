@@ -1623,9 +1623,12 @@ const WIPE_GROUPS: [(Text, &[Wipe]); 2] = [
 /// for one tell it; in English as it goes on from what leads to it, its
 /// first letter small.
 fn factory_reset(s: &State) -> String {
-    let cache = s.lang.pick(match s.cache_partition {
-        true => ["，最后格式化 cache 分区", "，最後格式化 cache 分割區", ", then formats cache"],
-        false => ["", "", ""],
+    let cache = s.lang.pick(if s.reset_preserves_oem_cache {
+        ["，保留厂商保留分区（/rbr）", "，保留廠商保留分割區（/rbr）", ", leaving the OEM reserve partition (/rbr) intact"]
+    } else if s.cache_partition {
+        ["，最后格式化 cache 分区", "，最後格式化 cache 分割區", ", then formats cache"]
+    } else {
+        ["", "", ""]
     });
     tr!(
         s.lang,

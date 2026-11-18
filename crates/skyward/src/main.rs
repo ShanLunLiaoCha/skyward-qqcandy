@@ -24,6 +24,8 @@ mod declaration_policy;
 #[cfg(any(target_os = "android", test))]
 mod reset_order;
 #[cfg(any(target_os = "android", test))]
+mod reset_fstab;
+#[cfg(any(target_os = "android", test))]
 mod wipe_adb;
 #[cfg(any(target_os = "android", test))]
 mod led_haptics;
@@ -614,7 +616,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
         if let Ok(steps) = &mut found {
             for step in steps {
                 if let skyward_programs::secure::Step::Start(program) = step {
-                    if program.service.path == "/system_ext/bin/hwservicemanager" {
+                    if matches!(program.service.path.as_str(), "/system_ext/bin/hwservicemanager" | "/mnt/system/system/bin/hwservicemanager") {
                         program.service.user = Some("root".to_string());
                         skyward_sys::kmsg("installed HIDL directory uses UID 0, matching stock fastboot's persistent hwbinder context UID")?;
                     }

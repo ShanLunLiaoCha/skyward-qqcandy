@@ -40,7 +40,13 @@ pub fn found(slot: skyward_vab::Slot, libraries: Option<&Path>) -> Result<Found>
         name(&unnamed)?;
         phone = read(slot, libraries)?;
     }
-    Ok(Found { described: phone.told_of(), steps: secure::steps(&phone) })
+    // The installed system is mounted with its own `system/` subtree.
+    // Pass it separately: only the legacy hwservicemanager RC may be read
+    // there, not its other init declarations or imports.
+    let named = format!("system{}", slot.suffix());
+    let installed = skyward_vab::mounted_partitions(slot)?;
+    let system = installed.iter().find(|m| m.partition == named).map(|m| m.mount_point.join("system"));
+    Ok(Found { described: phone.told_of(), steps: secure::steps_with_system(&phone, system.as_deref()) })
 }
 
 /// The phone as the partitions of the slot's installed system describe it,
