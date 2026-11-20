@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "origin": {
+    "version": "FIX16",
+    "image_sha256": "ac982a73ab5652d06592f77ec739306635e19c4b37d38f2b7db6b38c71de147f",
+    "source_archive": "skyward-pgz110-userdebug-FIX16-source-symbols.zip",
+    "source_archive_sha256": "7730cb1515c1f3394230b220b4fe488d86638223b5aae157a79dd8368d48d99b",
+    "runtime_status": "Existing candidate; not universal-version verified"
+  },
+  "files": {
+    "system/bin/recovery": "4319acef17756c5f28527c250300cd3dd48b26095c47c2282f1010f8e7b3d1e4",
+    "skyward/device.toml": "cf47b954d67b66d5a97f865db703b2d140e81beddfd2c94aab9e80841a397983",
+    "skyward/MiSansVF.ttf": "0ddef90648998900175cfdca9a6f087a2544c182f130b0ad4f7e94a03a115e79",
+    "skyward/KirkMono-Regular.ttf": "91f87957434d381a03f52c5d8348f22ba676ca6232730b5a106387ba75b18264",
+    "skyward/KirkMono-OFL.txt": "c1308bdce0e216eb8ffa59b7779bc6f601a561ddd09c2b9f07633c6a5c1ba271"
+  }
+}

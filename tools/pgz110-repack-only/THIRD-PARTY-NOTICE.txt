@@ -1,0 +1,5 @@
+Skyward sources: https://github.com/kirklin/skyward (base c5e09f6eb644e75e051b309f98d6745ccbc97d81).
+Exact modified donor source: skyward-pgz110-userdebug-FIX16-source-symbols.zip (SHA2567730cb1515c1f3394230b220b4fe488d86638223b5aae157a79dd8368d48d99b). Original Cargo dependency source/licenses were separately delivered in skyward-pgz110-v5-source.zip; not all re-bundled here.
+The included donor directory contains ONLY an existing compiled Skyward ELF, its config, fonts and font license. No OEM ramdisk/library/firmware or ADB keys are included. Font licensing and upstream notices remain applicable.
+avbtool.py is Android Open Source Project software; its original copyright/permission header is retained.
+LZ4/WSL/Python dependencies are not installed or downloaded by this tool.

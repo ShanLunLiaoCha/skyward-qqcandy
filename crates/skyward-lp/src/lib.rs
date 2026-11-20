@@ -1,3 +1,6 @@
+pub mod capacity;
+pub mod single_a;
+
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;

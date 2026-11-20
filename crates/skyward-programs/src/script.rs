@@ -255,13 +255,17 @@ fn option(program: &mut Program, words: &[String]) -> Result<()> {
             program.environment.push((rest[0].clone(), rest[1].clone()));
         }
         "interface" => {
-            ensure!(rest.len() == 2, "interface gives an interface and which of them it is");
             // A service of the newer kind is written as `aidl` and its whole
-            // name; one of the older kind as its interface and its instance.
-            program.interfaces.push(match rest[0].as_str() {
-                "aidl" => rest[1].clone(),
-                interface => format!("{interface}/{}", rest[1]),
-            });
+            // name, or in newer firmware as that whole name alone; one of the
+            // older kind as its interface and its instance.
+            match rest {
+                [whole] => program.interfaces.push(whole.clone()),
+                [kind, name] => program.interfaces.push(match kind.as_str() {
+                    "aidl" => name.clone(),
+                    interface => format!("{interface}/{name}"),
+                }),
+                _ => anyhow::bail!("interface gives an interface and which of them it is"),
+            }
         }
         "oneshot" => program.oneshot = true,
         "disabled" => program.disabled = true,

@@ -25,6 +25,9 @@ const BUNDLE_LIBS: &str = "lib64";
 /// made for.
 const VENDOR_INTERFACE: &str = "ro.vndk.version";
 
+/// The unversioned bundle name, read only when no versioned one exists.
+const CURRENT_VNDK: &str = "com.android.vndk.current";
+
 /// Where a recovery looks for the descriptions of the services the running
 /// system carries, and the one the recovery writes there of the phone's
 /// own.
@@ -159,10 +162,21 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
 /// against and give the directory they are in. A phone whose partitions
 /// need no bundle has none to open.
 pub fn libraries() -> Result<Option<PathBuf>> {
-    let Some(version) = skyward_sys::prop(VENDOR_INTERFACE) else { return Ok(None) };
-    ensure!(!version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
-        "{VENDOR_INTERFACE} is not a numeric VNDK version");
-    Ok(bundle(&format!("com.android.vndk.v{version}"), true)?.map(|at| at.join(BUNDLE_LIBS)))
+    let version = skyward_sys::prop(VENDOR_INTERFACE).filter(|value| !value.is_empty());
+    if let Some(version) = version.as_deref() {
+        ensure!(version.bytes().all(|b| b.is_ascii_digit()),
+            "{VENDOR_INTERFACE} is not a numeric VNDK version");
+    }
+    // A Recovery ramdisk often has no ro.vndk.version of its own; the phone's
+    // own partitions still carry exactly one versioned VNDK bundle.
+    // A versioned bundle is always preferred. com.android.vndk.current is
+    // only read when no versioned bundle is present at all.
+    let name = match version.as_deref() {
+        Some(version) => format!("com.android.vndk.v{version}"),
+        None => crate::bundle_paths::discover_vndk()
+            .unwrap_or_else(|| CURRENT_VNDK.to_owned()),
+    };
+    Ok(bundle(&name, true)?.map(|at| at.join(BUNDLE_LIBS)))
 }
 
 /// Open the bundle of this name where it lies, and give where it is. A

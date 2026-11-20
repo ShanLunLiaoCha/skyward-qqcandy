@@ -1,104 +1,207 @@
-![Skyward](assets/hero.jpg)
+![Skyward Recovery](assets/hero.jpg)
 
-# 一加 Ace 竞速版 Skyward · qqcandy
+# Skyward
 
 [English](README.md) | 简体中文
 
-本仓库 **skyward-qqcandy** 是 [Skyward](https://github.com/kirklin/skyward) 的一加 Ace 竞速版适配源码。Skyward 是从零使用 Rust 编写的第三方 Recovery；本适配为**非官方、实验性质项目**，不代表一加或 Skyward 上游的官方支持。
+Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 
-## 设备与当前状态
+<p align="center">
+  <img src="assets/home.png" width="30%" alt="首页">
+  <img src="assets/settings-dark.png" width="30%" alt="深色模式下的设置">
+  <img src="assets/time-zone.png" width="30%" alt="时区">
+</p>
 
-| 项目 | 内容 |
+## 功能
+
+### 双系统
+
+![一台手机可以安装两个系统](slides/zh-CN/out/01-dual-boot.png)
+
+![切换系统只改写两个分区](slides/zh-CN/out/02-dual-boot-partitions.png)
+
+第二系统的安装包格式和启动过程见下文的[双系统的工作方式](#双系统的工作方式)。
+
+### 解密
+
+![用锁屏图案或密码解密 data 分区](slides/zh-CN/out/03-decrypt.png)
+
+### 安装
+
+![从三个来源安装四种安装包](slides/zh-CN/out/04-install.png)
+
+刷机包的安装脚本可以使用 `7za` 和 `zstd`，支持刷入 super 镜像使用 zstd 压缩的第三方 ROM；`unzip -p` 边解压边输出镜像。安装脚本还可以使用 `avbctl` 关闭验证启动的校验，使用 `resetprop` 读取和设置属性。
+
+### 在线更新
+
+![系统和 Skyward 都能在线更新](slides/zh-CN/out/05-updates.png)
+
+### 备份和恢复
+
+![系统、应用和 IMEI 都可以备份](slides/zh-CN/out/06-backup.png)
+
+### 文件管理
+
+![在 Skyward 中管理手机里的文件](slides/zh-CN/out/07-files.png)
+
+### 终端
+
+![手机上就能运行 root shell](slides/zh-CN/out/08-terminal.png)
+
+### 连接电脑
+
+![用数据线连接电脑，传文件和刷写分区](slides/zh-CN/out/09-computer.png)
+
+### 清除数据
+
+![每一项都写明会清除哪些内容](slides/zh-CN/out/10-wipe.png)
+
+### 替换原厂 recovery
+
+![系统发来的请求，Skyward 照常处理](slides/zh-CN/out/11-requests.png)
+
+### 搜索
+
+![输入拼音首字母，就能找到功能](slides/zh-CN/out/12-search.png)
+
+### 高级
+
+![系统出了问题，可以先在这里修复](slides/zh-CN/out/13-tools.png)
+
+### 关于本机
+
+![电池剩余容量和充电循环都能查看](slides/zh-CN/out/14-specs.png)
+
+### 其他功能
+
+- 重启到系统、recovery、fastboot、bootloader 和 EDL，切换启动槽位
+- 浅色和深色模式，简体中文、繁体中文和英文
+
+### 没有系统时
+
+![super 中没有系统，也能装回一个系统](slides/zh-CN/out/15-no-system.png)
+
+## 支持的机型
+
+| 机型 | 代号 | 测试的系统版本 |
+| --- | --- | --- |
+| 小米 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM（Android 17） |
+| 小米 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM（Android 16） |
+
+### 🚧 施工中
+
+这些机型的镜像按照各自的原厂固件构建，还没有在真机上试过。屏幕、触摸、WLAN 和振动已经配置好。解密 data 分区所需的程序由 Skyward 在手机上从已安装系统的 init 脚本和服务描述中读出，每个机型的读取结果都用原厂固件核对过，这些程序在这些机型上的运行情况还没有验证。
+
+| 机型 | 代号 | 构建所用的系统版本 |
+| --- | --- | --- |
+| 🚧 小米 13 | `fuxi` | OS3.0.309.0.WMCCNXM（Android 16） |
+| 🚧 小米 13 Pro | `nuwa` | OS3.0.312.0.WMBCNXM（Android 16） |
+| 🚧 小米 14 | `houji` | OS3.0.307.0.WNCCNXM（Android 16） |
+| 🚧 小米 14 Pro | `shennong` | OS3.0.309.0.WNBCNXM（Android 16） |
+| 🚧 小米 14 Ultra | `aurora` | OS3.0.308.0.WNACNXM（Android 16） |
+| 🚧 小米 15 | `dada` | OS3.0.307.0.WOCCNXM（Android 16） |
+| 🚧 小米 15 Pro | `haotian` | OS3.0.309.0.WOBCNXM（Android 16） |
+| 🚧 小米 15 Ultra | `xuanyuan` | OS3.0.314.0.WOACNXM（Android 16） |
+| 🚧 小米 17 | `pudding` | OS4.0.4.0.XPCCNXM（Android 17） |
+| 🚧 小米 17 Pro | `pandora` | OS4.0.4.0.XBLCNXM（Android 17） |
+| 🚧 小米 17 Pro Max | `popsicle` | OS4.0.4.0.XPBCNXM（Android 17） |
+| 🚧 小米 17 Max | `byron` | OS3.0.310.0.WAFCNXM（Android 16） |
+| 🚧 REDMI K80 | `zorn` | OS3.0.309.0.WOKCNXM（Android 16） |
+| 🚧 REDMI K80 Pro | `miro` | OS3.0.305.0.WOMCNXM（Android 16） |
+| 🚧 REDMI K90 | `annibale` | OS3.0.307.0.WPKCNXM（Android 16） |
+| 🚧 REDMI K90 Pro Max | `myron` | OS4.0.4.0.XPMCNXM（Android 17） |
+| 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM（Android 16） |
+| 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM（Android 17） |
+| 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM（Android 17） |
+
+## 安装 Skyward
+
+Skyward 需要已解锁的 bootloader。从 [Releases](https://github.com/kirklin/skyward/releases) 下载对应机型的 zip，每个文件都标有机型和代号，例如 Xiaomi 17 Ultra (nezha)。使用 `SHA256SUMS` 核对并解压之后，在手机处于 fastboot 模式的时候，把其中的镜像刷入当前运行槽位的 recovery 分区：
+
+```sh
+unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
+fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+fastboot reboot recovery
+```
+
+之后连接 WLAN，就可以在“设置”的“Skyward 更新”页面更新到最新版本，也可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 recovery 分区的时候，Skyward 会重新刷回这些分区。
+
+Skyward 中的 adb 是 root shell，手机上无需授权：手机处于 recovery 的时候，任何人拿到手机和数据线都能访问其中的存储。
+
+## 双系统的工作方式
+
+Skyward 可以在手机自身分区中的系统旁边安装第二系统，主系统是 HyperOS 或者第三方 ROM 都可以，并在首页的“双系统”中切换。第二系统的根文件系统是 data 分区中的一个文件，文件系统不能移动或删除它，Skyward 直接通过分区读写其中的内容；两个系统的启动镜像保存在另一个这样的文件中。切换系统只改写下次启动槽位的 boot 和 init_boot 分区，每一步都先记录在 /metadata 中，切换过程中断电的话，Skyward 下次启动时会完成这次切换。vendor_boot、dtbo、recovery、vbmeta、固件和 super 都保持不变，第二系统使用主系统的 vendor_boot 和 dtbo 启动。
+
+其他操作写入启动分区之前，Skyward 会先把主系统的启动镜像写回：安装、切换启动槽位、fastboot、恢复出厂设置，以及备份或恢复启动分区。系统更新尚未合并的时候，暂不切换到第二系统；备份 data 分区的时候不包含第二系统。
+
+第二系统的安装包是 zip 文件，和其他安装包一样在“安装”页面安装：
+
+| 文件 | 内容 |
 | --- | --- |
-| 设备 | 一加 Ace 竞速版 / OnePlus Ace Racing Edition |
-| 型号 | PGZ110 |
-| 设备代号 | `qqcandy`（由适配维护者提供） |
-| 配置内部标识 | `OP5911`，保留供现有运行时与工具安全校验使用 |
-| 处理器 | 联发科天玑 8100-MAX |
-| 适配固件基线 | ColorOS 15 / Android 15 — `PGZ110_15.0.0.1600(CN01)` |
-| 原厂内核基线 | 官方原厂内核 `5.10.236` |
-| Recovery 所在分区 | A/B `vendor_boot`，**并非独立 `recovery` 分区** |
-| 上游源码基线 | [`c5e09f6`](https://github.com/kirklin/skyward/commit/c5e09f6eb644e75e051b309f98d6745ccbc97d81) |
+| `system.toml` | `id`、`name`、`version` 和 `filesystem`；`init` 是根文件系统中第一个运行的程序，默认为 `/sbin/init`；`minimum` 是根文件系统至少需要的空间，单位为字节 |
+| `boot.img` | bootloader 启动的内核 |
+| `rootfs.img` | 根文件系统的镜像，格式为 `filesystem` 指定的文件系统 |
+| `init_boot.img` | 只有自带第一阶段 ramdisk 的系统需要 |
 
-源码包含 MediaTek / Trustonic 解密服务、亮屏恢复与背光、触控按键、LED 振动、Wi-Fi 校准及启动、USB/MTP、启动和分区擦除策略等适配。**包含实现不等于所有功能均已真机验证。**
+没有自带 init_boot 镜像的系统，从 Skyward 生成的 init_boot 镜像启动。其中的程序按照主系统第一阶段的方式加载第一阶段的内核模块，包括模块之间的软依赖和内核命令行中给模块的参数，然后在 data 分区中找到根文件系统，挂载之后运行其中的 `init`。启动过程中出现任何错误，这个程序都会进入 Skyward，和主系统启动失败时进入 recovery 一样：它在 misc 中留下原因，把当前槽位 recovery 分区中的 ramdisk 按照 bootloader 启动 recovery 时内核解包的方式解包到自己的 ramdisk 上，然后交给 Skyward 的第一个程序运行，所以无论 bootloader 怎样处理重启，都能进入 Skyward。Skyward 显示原因；用户在“双系统”中切换之前，下次启动的仍是第二系统。启动长时间没有进展时，这个程序改为重启到 recovery；交给第二系统之前手机重启的话，下次启动时它会在 misc 中看到同样的请求，先进入 Skyward。两种方式都无法进入 Skyward 时，手机停留在出错的地方，不会反复启动同一个系统。自带第一阶段 ramdisk 的系统可以运行 Skyward 放在 `/skyward/map` 的程序，它把根文件系统映射为块设备，并输出设备节点的路径。每次切换到第二系统，Skyward 都用自己带的程序写入第二系统的 init_boot 镜像，所以更新 Skyward 以后，第二系统也用新的程序启动。
 
-既有交付说明记录了 Android 编译及部分主机测试通过，也记录过 data 解密和手动 Wi-Fi 联网的设备观察。本公开目录不包含这些原始日志，且本次仓库整理未独立复现上述结果。OTA 刷包、APEX RAM 后端、既有 device-mapper 映射复用、双系统和任意 ROM 兼容性，均不能视为本机已验证功能。其他设备配置来自上游，不表示本适配仓库对这些设备作出新的支持承诺。
+正在运行的系统也可以请求切换：在 misc 中写入 `boot-recovery` 和 `--switch_system=installed`，或者 `--switch_system=` 加上第二系统的 `id`，然后重启到 recovery。bootloader 仍然启动这个槽位的话（小米 13 Ultra 连着 USB 线时可能这样），Skyward 的程序会在下次启动时在 misc 中看到这个请求，先进入 Skyward。
 
-## 使用前必读
+## 构建
 
-- 解锁、刷写、解密和格式化可能导致数据永久丢失或无法开机。请先独立备份，并准备匹配的原厂固件及恢复途径。
-- **不要照搬上游小米设备的 `fastboot flash recovery` 命令。** 本机使用 `vendor_boot`；必须先确认固件、分区布局、槽位和救砖方式，本仓库不提供通用刷写命令。
-- 原厂 init、文件系统检查与 Trustonic 服务可能写入持久分区。Recovery 与诊断模式都**不是只读环境**。
-- 当前源码中的“全部数据”按“关闭 data → 格式化 metadata → 格式化 data”执行，并保留 PGZ110 的原厂共用 cache/RBR 分区（`oplusreserve2`）。格式化 metadata 会销毁加密密钥，无法撤销。此处描述的是当前源码，不代表此前发布的镜像已包含该改动。
-- userdebug 工具会启用 root/调试服务并使用显式提供的 ADB 公钥。不要把个人密钥、设备原始日志、Wi-Fi 凭据或调试镜像作为安全生产版本发布。
-- 上游针对小米的在线更新行为，不构成本一加适配的可用更新渠道。
-
-## 仓库结构
-
-```text
-crates/            Skyward 工作区、设备适配及源码测试
- devices/          上游设备定义及 OP5911 配置
- tools/            PGZ110 vendor_boot 打包与辅助工具
- resources/        字体资源及其单独许可声明
- assets/, slides/  上游项目图片和功能示意图
-```
-
-主配置为 [`devices/OP5911.toml`](devices/OP5911.toml)。[`devices/OP5911-decrypt.experimental.toml`](devices/OP5911-decrypt.experimental.toml) 和 [`devices/OP5911-boot.toml`](devices/OP5911-boot.toml) 为其他实验配置，不是可任意互换的稳定配置。`qqcandy` 用作设备展示名及仓库名；请勿全局替换 `OP5911`，现有机型校验依赖它。
-
-## 从源码构建
-
-建议使用 Linux 或 WSL2，并将源码和 NDK 放在 Linux 文件系统中。需要：[`rust-toolchain.toml`](rust-toolchain.toml) 指定的 Rust（当前为 `1.100.0`）、`aarch64-linux-android` 目标、Android NDK r29、Python 3。打包镜像还需要 `lz4`、AOSP `avbtool`、匹配固件的原厂 `vendor_boot.img` 及按各自许可使用的随附字体。**这不是无需外部依赖的离线一键构建包。**
-
-在仓库根目录运行：
+Skyward 使用 `rust-toolchain.toml` 指定版本的 Rust 和它的 `aarch64-linux-android` 目标、Android NDK r29 和 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) 构建。recovery 服务针对手机构建，打包工具针对电脑构建：
 
 ```sh
-export ANDROID_NDK_HOME=/path/to/android-ndk-r29
-export SKYWARD_SOURCE="$PWD"
-sh tools/build_android.sh
+cargo ndk -t arm64-v8a --platform 30 build --release -p skyward
+cargo build --release -p skyward-pack
 ```
 
-脚本为 Android API 30 编译 `skyward`，随后运行选定的主机库测试，不会刷写设备。依赖版本见 [`Cargo.lock`](Cargo.lock)，需自行保证依赖可获取。编译成功或主机测试通过不代表真机安全。仅运行这些主机测试可使用：
+第二系统启动时运行的第一个程序在任何动态库可用之前运行，因此构建为静态程序：
 
 ```sh
-cargo test --locked -p skyward-config -p skyward-crypto -p skyward-install -p skyward-systems --lib
+RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --release -p skyward-system-init --target-dir target/system-init
 ```
 
-不要盲目执行真机测试；部分测试会格式化文件系统、挂载分区或操作加密密钥。
-
-### 打包 vendor_boot
-
-[`tools/vendor_boot.py`](tools/vendor_boot.py) 以匹配的原厂镜像为基础，检查结构并保留 DTB、ramdisk 布局及原厂组件。未知 init 模板会被拒绝；不要删除检查来强行支持其他固件。
+打包工具从小米服务器上这个版本的完整更新包中取出原厂 recovery 分区，只读取这个分区所在的部分，并且按照设备配置文件核对 SHA-256：
 
 ```sh
-python3 tools/vendor_boot.py build --help
-python3 tools/vendor_boot.py inspect --stock /path/to/matching/vendor_boot.img
+target/release/skyward-pack stock --config devices/nezha.toml --out target/stock/nezha/recovery.img
+```
 
-mkdir -p out
-python3 tools/vendor_boot.py build \
-  --stock /path/to/matching/vendor_boot.img \
+然后在它的基础上构建镜像：
+
+```sh
+target/release/skyward-pack recovery \
+  --stock target/stock/nezha/recovery.img \
   --binary target/aarch64-linux-android/release/skyward \
-  --config devices/OP5911.toml \
+  --system-init target/system-init/aarch64-linux-android/release/system-init \
+  --config devices/nezha.toml \
   --font resources/fonts/MiSansVF.ttf \
   --mono resources/fonts/KirkMono-Regular.ttf \
   --mono-license resources/fonts/KirkMono-OFL.txt \
-  --avbtool /path/to/avbtool.py \
-  --ack-experimental --ack-stock-init-writes \
-  --allow-unified-platform-fragment \
-  --out out/skyward-qqcandy-vendor_boot.img
+  --out target/skyward-nezha.img
 ```
 
-这只是打包示例，**不是刷机教程或已验证版本保证**。`--allow-unified-platform-fragment` 仅适用于已审查的匹配镜像布局。若原镜像没有 AVB footer，还需提供已核实的分区容量。输出采用未签名 AVB hash footer（`algorithm NONE`），不是原厂签名。工具不执行刷写。
+测试和代码检查在电脑上运行；只在手机上运行的代码按照手机目标检查：
 
-保留的 userdebug、OTA 提取和 Wi-Fi 辅助脚本面向开发者；使用前应检查源码和各自 `--help`。GitHub Actions 仅手动执行源码检查与编译，不下载原厂固件、不打包镜像、不自动发布 Release。
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo ndk -t arm64-v8a --platform 30 clippy --workspace --all-targets -- -D warnings
+```
 
-## 上游、修改与许可证
+名称以 `on_the_phone` 开头的测试会创建文件系统、挂载分区、设置加密密钥，这些操作只有手机能够完成。把一台已经进入 Skyward、数据分区已经打开的手机通过 adb 连接到电脑，`cargo ndk` 会把每个测试程序推送到手机上运行，测试逐个执行：
 
-原项目由 [kirklin 及上游贡献者](https://github.com/kirklin/skyward/graphs/contributors) 开发。保留原有名称、版权声明和未经改动的 [`LICENSE`](LICENSE)。工作区声明为 **GPL-3.0-or-later**；本设备适配按相同许可证分发，不代表上游认可或背书。
+```sh
+cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
+```
 
-修改日期、来源和第三方分发要求见 [`NOTICE.md`](NOTICE.md)。第三方库和字体保留各自许可，不能用项目 GPL 代替。界面使用小米 MiSans，字体原样保留为 Skyward 项目资源，不作为独立字体分发。已附上来自[小米官方](https://hyperos.mi.com/font/download)的中英文[许可协议](resources/fonts/MiSans-LICENSE.txt)，须遵守其独立条款，不将其重新授权为 GPL。Kirk Mono 与 OFL 声明一起保留。
+`skyward-preview` 无需手机，在电脑上把页面绘制成 PNG 文件：每个页面完整绘制成长截图的样子，覆盖它可能处于的各种状态，另外还有触摸和动画过程中某些时刻的屏幕。`--lang` 按照地区代码选择语言，例如 `en` 或者 `zh-TW`：
 
-分发编译后的程序或镜像前，须按适用许可证提供与该版本对应的完整源码、相关构建脚本、依赖及所需第三方许可和声明。仅有 lockfile 或“此前私下交付过压缩包”的说明不能替代这些义务。本仓库不附带原厂固件、专有运行时文件，也不代表取得了这些文件的第三方再分发授权。
+```sh
+cargo run --release -p skyward-preview -- target/preview --lang en
+```
 
-## 反馈问题
+## 许可证
 
-请提供机型、固件版本、源码版本、所用配置及最小复现步骤。日志需先去除序列号、密钥、Wi-Fi 信息与个人数据。不要为了反馈问题而测试破坏性操作。
+[GPL-3.0-or-later](LICENSE)

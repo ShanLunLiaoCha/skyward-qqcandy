@@ -463,6 +463,116 @@ pub fn mounted_partitions(slot: Slot) -> Result<Vec<Mounted>> {
     Ok(found.into_iter().map(|(_, m)| m).collect())
 }
 
+/// Enumerate only the current slot's exact LP linear/zero holders of super.
+/// Suitable for planning a maintenance handoff, not proof that they can be
+/// removed: processes, stacked mounts and detached open files can still pin
+/// a mapping. This observation never changes mount or DM state.
+#[cfg(target_os = "android")]
+pub fn audit_linear_super_holders(slot: Slot) -> Result<Vec<String>> {
+    Ok(checked_linear_super_holders(slot)?.into_iter().map(|holder| holder.name).collect())
+}
+
+#[cfg(target_os = "android")]
+struct LinearHolder {
+    name: String,
+    point: PathBuf,
+    status: dm::DeviceStatus,
+    table: Vec<dm::Line>,
+}
+
+#[cfg(target_os = "android")]
+fn checked_linear_super_holders(slot: Slot) -> Result<Vec<LinearHolder>> {
+    let super_path = super_device();
+    let metadata = skyward_lp::read(&super_path, slot.number())?;
+    ensure!(metadata.damaged.is_empty() && metadata.block_devices.len() == 1
+        && metadata.block_devices[0].partition_name == "super", "handoff requires valid single-super metadata");
+    let id = devnum(&super_path)?;
+    let path = Path::new("/sys/dev/block").join(format!("{}:{}", id.0, id.1)).join("holders");
+    let snapshot = || -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let name = fs::read_to_string(entry.path().join("dm/name"))?;
+            let device = fs::read_to_string(entry.path().join("dev"))?;
+            ensure!(out.len() < metadata.partitions.len(), "unexpected number of super holders");
+            out.push((name.trim().to_owned(), device.trim().to_owned()));
+        }
+        out.sort_unstable();
+        ensure!(out.windows(2).all(|pair| pair[0].0 != pair[1].0), "duplicate super holder name");
+        Ok(out)
+    };
+    let holders = snapshot()?;
+    let partitions = slot_partitions(&metadata, slot);
+    let mut verified = Vec::new();
+    for (name, device) in &holders {
+        let partition = partitions.iter().find(|part| part.name == *name)
+            .with_context(|| format!("unknown or other-slot holder {name}"))?;
+        let status = dm::device_status(name)?.with_context(|| format!("holder {name} disappeared"))?;
+        ensure!(*device == format!("{}:{}", status.device.0, status.device.1), "holder {name} identity differs");
+        let table = dm::table(name)?;
+        reusable_linear(&status, &table, &targets(partition, &[id])).with_context(|| format!("audit handoff holder {name}"))?;
+        ensure!(dm::device_status(name)?.as_ref() == Some(&status) && dm::table(name)? == table,
+            "holder {name} changed during handoff audit");
+        verified.push(LinearHolder { name: name.clone(), point: mount_point(base(partition, slot)), status, table });
+    }
+    ensure!(snapshot()? == holders, "super holder roster changed during handoff audit");
+    Ok(verified)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn valid_handoff_mounts(expected: &Path, found: &[PathBuf], visible_matches: bool) -> bool {
+    found.is_empty() || (found.len() == 1 && found[0] == expected && visible_matches)
+}
+
+#[cfg(test)]
+#[test]
+fn handoff_does_not_release_aliased_or_covered_mounts() {
+    let p = Path::new("/vendor");
+    assert!(valid_handoff_mounts(p, &[], false));
+    assert!(valid_handoff_mounts(p, &[p.into()], true));
+    assert!(!valid_handoff_mounts(p, &[p.into()], false));
+    assert!(!valid_handoff_mounts(p, &[p.into(), "/mnt/vendor-alias".into()], true));
+    assert!(!valid_handoff_mounts(p, &["/data".into()], true));
+}
+
+/// Release only known PGZ110 LP holders after the caller has quiesced the UI
+/// and all installed-system services. Never lazily unmount or force-remove.
+/// A partial release is possible, but it makes no partition-content writes.
+#[cfg(target_os = "android")]
+pub fn release_linear_handoff(slot: Slot) -> Result<()> {
+    const BASES: &[&str] = &["system", "system_ext", "product", "vendor", "vendor_dlkm", "odm", "odm_dlkm",
+        "my_bigball", "my_carrier", "my_company", "my_engineering", "my_heytap", "my_manifest", "my_preload",
+        "my_product", "my_region", "my_stock"];
+    let mut holders = checked_linear_super_holders(slot)?;
+    let check = |holder: &LinearHolder| -> Result<Vec<PathBuf>> {
+        let name = &holder.name;
+        let base = name.strip_suffix(slot.suffix()).context("handoff holder lacks current slot suffix")?;
+        ensure!(BASES.contains(&base), "unexpected LP handoff partition {name}");
+        let id = holder.status.device;
+        ensure!(dm::device_status(name)?.as_ref() == Some(&holder.status) && dm::table(name)? == holder.table,
+            "handoff mapping {name} changed");
+        let sys = Path::new("/sys/dev/block").join(format!("{}:{}", id.0, id.1));
+        ensure!(fs::read_dir(sys.join("holders"))?.next().transpose()?.is_none(), "downstream device holds {name}");
+        let users = mount::holding(id)?;
+        ensure!(users.is_empty(), "users still hold {name}: {users:?}");
+        let mounts = mount::points_of(id)?;
+        let visible = mount::visible(&holder.point)?.is_some_and(|visible| visible.device == id);
+        ensure!(valid_handoff_mounts(&holder.point, &mounts, visible),
+            "unexpected mount aliases for {name}: {mounts:?}");
+        Ok(mounts)
+    };
+    for holder in &holders { check(holder)?; }
+    holders.sort_by_key(|h| std::cmp::Reverse((h.point.components().count(), h.status.device.1)));
+    for holder in holders {
+        if !check(&holder)?.is_empty() { mount::umount(&holder.point)?; }
+        ensure!(check(&holder)?.is_empty(), "mount remains for {}", holder.name);
+        dm::remove(&holder.name)?;
+        ensure!(dm::device_status(&holder.name)?.is_none(), "{} remains mapped", holder.name);
+    }
+    ensure!(checked_linear_super_holders(slot)?.is_empty(), "super gained a holder during handoff");
+    Ok(())
+}
+
 /// Take the slot's mounted partitions away before an update writes over
 /// them: unmount them and remove their device-mapper devices. A partition
 /// whose mount point is in `busy` still has files in use; it only leaves

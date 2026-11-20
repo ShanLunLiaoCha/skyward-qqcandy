@@ -88,6 +88,8 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     file.seek(SeekFrom::Start(0)).context("rewind the package")?;
     let mut zip = ZipArchive::new(file).context("read the zip directory")?;
     if zip.index_for_name(PAYLOAD).is_some() {
+        // A payload ZIP always goes through update_engine. In particular,
+        // malformed payload metadata cannot fall back to its update-binary.
         return update(&mut zip).map(Package::Update);
     }
     if skyward_systems::package::is_system(&zip) {
@@ -97,6 +99,21 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
         return Ok(Package::Script);
     }
     Ok(Package::Unknown)
+}
+
+/// Probe only the ZIP directory so a port's own updater is not preempted
+/// by parsing payload metadata before its package type is established.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn embeds_payload_and_script(mut file: impl Read + Seek) -> Result<bool> {
+    let mut magic = [0u8; 4];
+    if let Err(error) = file.read_exact(&mut magic) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof { return Ok(false); }
+        return Err(error.into());
+    }
+    if &magic != b"PK\x03\x04" { return Ok(false); }
+    file.seek(SeekFrom::Start(0))?;
+    let zip = ZipArchive::new(file).context("read the zip directory")?;
+    Ok(zip.index_for_name(PAYLOAD).is_some() && zip.index_for_name(UPDATE_BINARY).is_some())
 }
 
 fn update<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Update> {
@@ -114,8 +131,12 @@ fn update<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Update> {
 
 fn text<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<String> {
     let mut entry = zip.by_name(name).with_context(|| format!("open {name}"))?;
+    const TEXT_LIMIT: u64 = 1 << 20;
+    let expected = entry.size();
+    anyhow::ensure!(expected <= TEXT_LIMIT, "{name} exceeds the OTA text limit");
     let mut s = String::new();
-    entry.read_to_string(&mut s).with_context(|| format!("read {name}"))?;
+    (&mut entry).take(TEXT_LIMIT + 1).read_to_string(&mut s).with_context(|| format!("read {name}"))?;
+    anyhow::ensure!(s.len() as u64 == expected, "OTA text size disagrees with ZIP directory for {name}");
     Ok(s)
 }
 
@@ -141,13 +162,27 @@ pub struct Build {
 
 /// Whether `update` may go on `phone`.
 pub fn check(update: &Update, phone: &Phone) -> Result<(), Refusal> {
+    check_inner(update, phone, true)
+}
+
+/// Do not compare a package's product name on the shared PGZ110/PGJM10
+/// Recovery profile. Retail and internal model tags need not match. Physical
+/// restore target identification and all non-model checks remain independent.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn check_for_recovery(update: &Update, phone: &Phone, config: &skyward_config::DeviceConfig) -> Result<(), Refusal> {
+    let shared = matches!(config.device.codename.as_str(), "OP5911" | "PGZ110" | "PGJM10")
+        && config.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot;
+    check_inner(update, phone, !shared)
+}
+
+fn check_inner(update: &Update, phone: &Phone, check_model: bool) -> Result<(), Refusal> {
     let m = &update.metadata;
     let kind = m.get("ota-type").unwrap_or_default();
     if kind != "AB" {
         return Err(Refusal::NotAb(kind.to_string()));
     }
     let devices = m.get("pre-device").unwrap_or_default();
-    if !listed(&phone.device, devices) {
+    if check_model && !listed(&phone.device, devices) {
         return Err(Refusal::OtherDevice(devices.to_string()));
     }
     if let Some(serials) = m.get("serialno")
@@ -212,6 +247,64 @@ METADATA_SIZE=1024
             device: "ishtar".into(),
             serial: "2674dc3e".into(),
             installed: Some(Build { timestamp: 1_778_243_655, security_patch: "2026-04-01".into() }),
+        }
+    }
+
+    fn model_config(codename: &str, vendor_boot: bool) -> skyward_config::DeviceConfig {
+        let partition = if vendor_boot { "recovery_partition='vendor_boot'\n" } else { "" };
+        skyward_config::DeviceConfig::parse(&format!("[device]\ncodename='{codename}'\n{partition}")).unwrap()
+    }
+
+    #[test]
+    fn op5911_vendor_boot_matches_both_model_tags_and_the_stock_ota_tag() {
+        let config = model_config("OP5911", true);
+        for runtime in ["ossi", "OP5911", "PGZ110", "PGJM10"] {
+            let phone = Phone { device: runtime.into(), ..phone() };
+            for tag in ["OP5911", "PGZ110", "PGJM10", "other | PGJM10"] {
+                let metadata = METADATA_TEXT.replace("pre-device=ishtar", &format!("pre-device={tag}"));
+                assert_eq!(check_for_recovery(&update_with(&metadata, PROPERTIES_TEXT), &phone, &config), Ok(()),
+                    "{runtime} should accept {tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_recovery_does_not_require_a_package_product_tag() {
+        let phone = Phone { device: "ossi".into(), ..phone() };
+        for name in ["OP5911", "PGZ110", "PGJM10"] {
+            let config = model_config(name, true);
+            for metadata in [METADATA_TEXT.replace("pre-device=ishtar", ""), METADATA_TEXT.replace("pre-device=ishtar", "pre-device=internal-codename")] {
+                assert_eq!(check_for_recovery(&update_with(&metadata, PROPERTIES_TEXT), &phone, &config), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn model_tags_do_not_leak_out_of_op5911_vendor_boot() {
+        let metadata = METADATA_TEXT.replace("pre-device=ishtar", "pre-device=PGJM10");
+        let update = update_with(&metadata, PROPERTIES_TEXT);
+        let phone = Phone { device: "PGZ110".into(), ..phone() };
+        for config in [model_config("OP5911", false), model_config("ishtar", true)] {
+            assert!(matches!(check_for_recovery(&update, &phone, &config), Err(Refusal::OtherDevice(_))));
+            assert_eq!(check_for_recovery(&update_with(METADATA_TEXT, PROPERTIES_TEXT), &Phone { device: "ishtar".into(), ..phone.clone() }, &config), Ok(()));
+        }
+        assert!(matches!(check(&update, &phone), Err(Refusal::OtherDevice(_))));
+    }
+
+    #[test]
+    fn matching_model_tags_do_not_change_other_package_checks() {
+        let config = model_config("OP5911", true);
+        let phone = Phone { device: "ossi".into(), ..phone() };
+        let metadata = METADATA_TEXT.replace("pre-device=ishtar", "pre-device=PGJM10");
+        for (field, value, refusal) in [
+            ("ota-type", "BLOCK", Refusal::NotAb("BLOCK".into())),
+            ("serialno", "different", Refusal::OtherSerial),
+            ("pre-build-incremental", "required", Refusal::Incremental),
+            ("post-timestamp", "1", Refusal::Older { package: 1, installed: 1_778_243_655 }),
+            ("post-security-patch-level", "2026-03-01", Refusal::OlderPatch { package: "2026-03-01".into(), installed: "2026-04-01".into() }),
+        ] {
+            let changed = format!("{metadata}\n{field}={value}\n");
+            assert_eq!(check_for_recovery(&update_with(&changed, PROPERTIES_TEXT), &phone, &config), Err(refusal));
         }
     }
 
@@ -298,6 +391,7 @@ METADATA_SIZE=1024
     fn an_update_zip_gives_where_its_stored_payload_starts() {
         let payload = b"CrAU\0\0\0\0\0\0\0\x02rest of the payload";
         let bytes = zip_with(&[
+            (UPDATE_BINARY, b"#!/sbin/sh\nexit 99\n", CompressionMethod::Deflated),
             ("payload.bin", payload, CompressionMethod::Stored),
             ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
             ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Deflated),
@@ -311,10 +405,31 @@ METADATA_SIZE=1024
     }
 
     #[test]
+    fn mixed_zip_is_detected_without_requiring_valid_ota_metadata() {
+        let script = (UPDATE_BINARY, b"#!/sbin/sh\n".as_slice(), CompressionMethod::Stored);
+        let payload = (PAYLOAD, b"CrAU".as_slice(), CompressionMethod::Stored);
+        for only in [script, payload] {
+            assert!(!embeds_payload_and_script(Cursor::new(zip_with(&[only]))).unwrap());
+        }
+        let mixed = zip_with(&[script, payload]);
+        assert!(embeds_payload_and_script(Cursor::new(&mixed)).unwrap());
+        assert!(identify(Cursor::new(mixed)).is_err(), "official branch cannot fall back on a malformed payload");
+    }
+
+    #[test]
+    fn a_zip_with_oversized_ota_text_does_not_run_a_script() {
+        let oversized = vec![b'A'; (1 << 20) + 1];
+        let archive = zip_with(&[(UPDATE_BINARY, b"unused", CompressionMethod::Stored),
+            (PAYLOAD, b"CrAU", CompressionMethod::Stored), (PROPERTIES, &oversized, CompressionMethod::Deflated)]);
+        assert!(identify(Cursor::new(archive)).unwrap_err().to_string().contains("exceeds the OTA text limit"));
+    }
+
+    #[test]
     fn script_zips_compressed_payloads_and_other_files_are_told_apart() {
         let script = zip_with(&[("META-INF/com/google/android/update-binary", b"#!/sbin/sh\n", CompressionMethod::Deflated)]);
         assert_eq!(identify(Cursor::new(script)).unwrap(), Package::Script);
         let squeezed = zip_with(&[
+            (UPDATE_BINARY, b"#!/sbin/sh\nexit 99\n", CompressionMethod::Deflated),
             ("payload.bin", &[7u8; 4096], CompressionMethod::Deflated),
             ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
             ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Stored),

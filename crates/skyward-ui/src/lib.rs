@@ -13,6 +13,7 @@ pub mod glow;
 pub mod icons;
 pub mod lang;
 pub mod motion;
+pub mod ota_catalog;
 pub mod pages;
 pub mod search;
 pub mod resume_policy;

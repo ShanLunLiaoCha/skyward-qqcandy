@@ -189,6 +189,13 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         if user == OWNER && open_legacy_owner_without_lock(service)? {
             continue;
         }
+        // A phone whose owner never set a screen lock keeps no credential
+        // blob at all; its own files are still wrapped for the secure world
+        // alone, and open with the hardware key nothing else guards.
+        if !blobs(user).is_dir() {
+            if user == OWNER && open_credential_free_user(service, user)? { continue; }
+            anyhow::bail!("the phone keeps no credential blob for user {user} and no credential-free key for it");
+        }
         let protector = protector(user)?;
         match protector.lock {
             None => {
@@ -201,6 +208,25 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         }
     }
     Ok(Opening { mounted, closed: open_made_up(service, closed, &owner) })
+}
+
+/// Open a user's own files where the phone kept their key for the secure
+/// world alone, with no credential of the owner's in the way.
+fn open_credential_free_user(service: &KeyMint, user: u32) -> Result<bool> {
+    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    if !dir.is_dir() { return Ok(false); }
+    let stored = StoredKey::load_legacy_hardware(&dir).context("read the credential-free CE hardware key")?;
+    let mut raw = match stored.unwrap(Unwrap::Hardware(service)) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(false),
+    };
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    if wrapped { raw = service.ephemeral_storage_key(&raw).context("make the credential-free CE key usable now")?; }
+    crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
+    if user == OWNER { show_owner_storage()?; }
+    skyward_sys::kmsg(&format!("user {user} storage opened without a credential"))?;
+    Ok(true)
 }
 
 /// A.16 can store owner CE directly under vold's credential-free hardware

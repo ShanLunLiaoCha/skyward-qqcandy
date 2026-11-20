@@ -69,10 +69,42 @@ def instrument(raw,binary,key,logd_runtime=None):
  rd.replace(init,text.encode())
  rd.replace('system/bin/skyward-userdebug-recovery.sh',(tools/'userdebug-recovery.sh').read_bytes(),0o755)
  rd.replace('system/bin/skyward-userdebug-logger.sh',(tools/'userdebug-logger.sh').read_bytes(),0o755)
+ import os
+ extra=[item for item in os.environ.get('SKYWARD_EXTRA_ASSETS','').split(os.pathsep) if item]
+ built_in=[]
+ for item in extra:
+  source=pathlib.Path(item)
+  if not source.is_file():raise vb.FormatError('extra asset is not a regular file: '+str(source))
+  blob=source.read_bytes()
+  if len(blob)>8*1024*1024:raise vb.FormatError('extra asset exceeds its bound: '+str(source))
+  name='skyward/'+source.name
+  rd.replace(name,blob,0o644);built_in.append((name,hashlib.sha256(blob).hexdigest()))
+ drop=[item for item in os.environ.get('SKYWARD_DROP_MODULES','').split(',') if item]
+ dropped=[]
+ for base in drop:
+  if '/' in base or not base.endswith('.ko'):raise vb.FormatError('drop list must name modules only: '+base)
+  target='lib/modules/'+base
+  if target not in paths:continue
+  rd.entries=[entry for entry in rd.entries if entry.name!=target]
+  dropped.append(base)
+ if dropped:
+  # Keep the module dependency lists consistent with what remains.
+  for listname in ['lib/modules/modules.load','lib/modules/modules.load.recovery',
+                   'lib/modules/modules.dep','lib/modules/modules.alias','lib/modules/modules.softdep']:
+   if listname not in paths:continue
+   text=paths[listname].data.decode('utf-8')
+   kept=[line for line in text.splitlines() if not any(name in line for name in dropped)]
+   updated='\n'.join(kept)+('\n' if text.endswith('\n') else '')
+   if updated!=text:rd.replace(listname,updated.encode(),paths[listname].mode)
+ for target in [item for item in os.environ.get('SKYWARD_DROP_FILES','').split(',') if item]:
+  if target not in paths:raise vb.FormatError('drop file is absent from the image: '+target)
+  rd.entries=[entry for entry in rd.entries if entry.name!=target]
+  dropped.append(target)
  out=image.repack(0,vb.compress_ramdisk(rd.encode(),vb.compression(image.fragments[0].data)))
  return out,{'public_key_sha256':fingerprint,'private_key_read':False,'properties_patched':updated_props,
  'recovery_service':'stock init -> sh wrapper -> /system/bin/recovery (basename dispatch)',
  'log_directory':'/tmp/skyward-userdebug','normal_recovery_workflow_retained':True,'logd_runtime':logd_status,
+ 'built_in_assets':built_in,'dropped_modules':dropped,
  'auth_policy':'ro.adb.secure=0 plus explicit /adb_keys public-key preauthorization; OEM compile-time auth may remain enabled'}
 
 def main():

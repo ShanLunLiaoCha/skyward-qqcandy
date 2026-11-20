@@ -31,6 +31,14 @@ mod wipe_adb;
 mod led_haptics;
 #[cfg(any(target_os = "android", test))]
 mod boot_services;
+#[cfg(target_os = "android")]
+mod lp_handoff;
+#[cfg(any(target_os = "android", test))]
+mod factory_restore;
+#[cfg(any(target_os = "android", test))]
+mod lp_ota_ticket;
+#[cfg(any(target_os = "android", test))]
+mod restore_service_provenance;
 #[cfg(any(target_os = "android", test))]
 mod phoenix;
 #[cfg(target_os = "android")]
@@ -130,6 +138,97 @@ enum Cmd {
     },
     /// Tell what a package or image is, the way the installer reads it.
     Identify { file: PathBuf },
+    /// Prepare a PGZ110 vendor_boot candidate as a new file, never flash it.
+    #[cfg(target_os = "android")]
+    PrepareVendorBoot { stock: PathBuf, output: PathBuf },
+    /// Check per-slot staged images and the prospective vendor_boot AVB binding.
+    /// Uses ordinary files only; never opens a partition or flashes.
+    #[cfg(target_os = "android")]
+    AuditVendorBoot { package: PathBuf, slot: String, #[arg(long)] staged: Option<PathBuf> },
+    /// Prepare .211's A-slot vendor_boot and AVB-off development candidates as ordinary files.
+    #[cfg(target_os = "android")]
+    PrepareAvbOffA { package: PathBuf, output_directory: PathBuf },
+    /// Inspect a payload and replacement images against the physical super size.
+    /// Does not write a partition, disable AVB or change the active slot.
+    #[cfg(target_os = "android")]
+    PreflightOta {
+        package: PathBuf,
+        #[arg(long)] my_company: PathBuf,
+        #[arg(long)] my_preload: PathBuf,
+        /// Verify the entire ZIP with Recovery's trusted OTA certificates and compare its reviewed inventory.
+        #[arg(long)] verify_official: bool,
+    },
+    /// Build a Virtual A/B super candidate with only A populated, as a new file.
+    #[cfg(target_os = "android")]
+    PrepareSuperA {
+        package: PathBuf,
+        #[arg(long)] my_company: PathBuf,
+        #[arg(long)] my_preload: PathBuf,
+        #[arg(long)] output: PathBuf,
+    },
+    /// Observe the two OEM UFS preloader mappings; never write them.
+    #[cfg(target_os = "android")]
+    AuditPreloaderMaps,
+    /// Observe current .211 restore prerequisites without staging images or writing.
+    #[cfg(target_os = "android")]
+    AuditFactoryAvailability,
+    /// Report OEM merge state from the isolated LP maintenance boot only.
+    #[cfg(target_os = "android")]
+    QueryMaintenanceMerge,
+    /// Read live super holder tables without changing mappings or mounts.
+    #[cfg(target_os = "android")]
+    AuditLpHandoffHolders,
+    /// Ask the idle Recovery UI to enter diagnostic maintenance without rebooting.
+    #[cfg(target_os = "android")]
+    RequestLpHandoff,
+    #[cfg(target_os = "android")]
+    #[command(hide = true)]
+    RunLpHandoff {
+        #[arg(long, requires = "ota_fd")] ticket_fd: Option<i32>,
+        #[arg(long, requires = "ticket_fd")] ota_fd: Option<i32>,
+    },
+    #[cfg(target_os = "android")]
+    #[command(hide = true)]
+    ResumeLpOta {
+        #[arg(long)] ticket_fd: i32,
+        #[arg(long)] ota_fd: i32,
+    },
+    /// Repair the one verified PGZ110 .211 incident before a normal OTA.
+    #[cfg(target_os = "android")]
+    RepairMaintenanceLp {
+        /// Confirm persistent snapshot archival and LP metadata writes.
+        #[arg(long)] accept_metadata_repair: bool,
+    },
+    /// Query the OEM HIDL 1.2 boot service while super is exclusively held read-only.
+    #[cfg(target_os = "android")]
+    AuditRestoreBootControl {
+        /// Explicitly start and stop the stock services for this probe only.
+        #[arg(long)] start_stock: bool,
+    },
+    /// Stage the reviewed official .211 restore bundle as ordinary files, without flashing.
+    #[cfg(target_os = "android")]
+    PrepareFactoryA {
+        package: PathBuf,
+        #[arg(long)] my_company: PathBuf,
+        #[arg(long)] my_preload: PathBuf,
+        #[arg(long)] output_directory: PathBuf,
+        #[arg(long)] avb_off: bool,
+        /// After staging, check the 26 A-only targets with read-only exclusive claims.
+        #[arg(long, conflicts_with = "audit_physical_ab")] audit_targets: bool,
+        /// After staging, check 51 targets: both physical slots and one A-only super.
+        #[arg(long)] audit_physical_ab: bool,
+    },
+    /// EXPERIMENTAL: restore official .211 physical images to A and B; super contains A only.
+    #[cfg(target_os = "android")]
+    RestoreFactoryAbTest {
+        package: PathBuf,
+        #[arg(long)] my_company: PathBuf,
+        #[arg(long)] my_preload: PathBuf,
+        #[arg(long)] output_directory: PathBuf,
+        #[arg(long)] avb_off: bool,
+        /// Explicit acknowledgment: both physical slots will be overwritten; B is not a fallback.
+        #[arg(long)] accept_both_slots_no_rollback: bool,
+    },
     /// Discard all a block device holds and write zeros over its start, as
     /// a factory reset erases the data partition.
     #[cfg(target_os = "android")]
@@ -329,6 +428,96 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Identify { file } => identify(&file),
+        #[cfg(target_os = "android")]
+        Cmd::PrepareVendorBoot { stock, output } => prepare_vendor_boot(&stock, &output),
+        #[cfg(target_os = "android")]
+        Cmd::AuditVendorBoot { package, staged, slot } => audit_vendor_boot(&package, staged.as_deref(), &slot),
+        #[cfg(target_os = "android")]
+        Cmd::PrepareAvbOffA { package, output_directory } => prepare_avb_off_a(&package, &output_directory),
+        #[cfg(target_os = "android")]
+        Cmd::PreflightOta { package, my_company, my_preload, verify_official } => preflight_ota(&package, &my_company, &my_preload, verify_official),
+        #[cfg(target_os = "android")]
+        Cmd::PrepareSuperA { package, my_company, my_preload, output } => prepare_super_a(&package, &my_company, &my_preload, &output),
+        #[cfg(target_os = "android")]
+        Cmd::AuditRestoreBootControl { start_stock } => {
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            let active = boot_services::audit_for_restore(&cfg, start_stock)?;
+            println!("Read-only OEM HIDL 1.2 audit succeeded with super exclusively held; next slot is {active:?}. Setter was not tested.");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::RequestLpHandoff => {
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            lp_handoff::queue(&cfg)?;
+            println!("Queued read-only LP maintenance handoff; leave Recovery open on its normal menu.");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::RunLpHandoff { ticket_fd, ota_fd } => {
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            match (ticket_fd, ota_fd) {
+                (None, None) => lp_handoff::run(&cfg),
+                (Some(ticket), Some(ota)) => lp_handoff::run_confirmed(&cfg, ticket, ota),
+                _ => anyhow::bail!("incomplete OTA continuation"),
+            }
+        }
+        #[cfg(target_os = "android")]
+        Cmd::ResumeLpOta { ticket_fd, ota_fd } => lp_handoff::resume(ticket_fd, ota_fd),
+        #[cfg(target_os = "android")]
+        Cmd::AuditLpHandoffHolders => {
+            anyhow::ensure!(ramdisk::in_recovery(), "handoff holder audit is only intended for Recovery");
+            let slot = booted_slot()?;
+            let holders = skyward_vab::audit_linear_super_holders(slot)?;
+            for name in &holders { println!("Verified current-slot LP holder: {name}"); }
+            println!("{} verified holders; this does not establish that they are safe to release", holders.len());
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::RepairMaintenanceLp { accept_metadata_repair } => {
+            anyhow::ensure!(accept_metadata_repair, "explicit metadata repair confirmation is required");
+            anyhow::ensure!(ramdisk::in_recovery() && Path::new(skyward_sys::RUN).join("lp-maintenance.txt").is_file(),
+                "requires the isolated LP maintenance boot");
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            let archive = boot_services::repair_captured_lp(&cfg, booted_slot()?)?;
+            println!("LP capacity repaired and verified; original records and LP tables saved at {}. No OTA run or reboot requested.", archive.display());
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::QueryMaintenanceMerge => {
+            anyhow::ensure!(ramdisk::in_recovery() && Path::new(skyward_sys::RUN).join("lp-maintenance.txt").is_file(),
+                "requires the isolated LP maintenance boot");
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            let (slot, merge) = boot_services::query_oem_merge_readonly(&cfg)?;
+            println!("OEM BootControl next slot: {slot:?}; merge: {merge:?}. Diagnostic only, no write authorization.");
+            let residue = skyward_install::lp_capacity::audit_captured_residue(booted_slot()?, slot, merge);
+            println!("Captured .211 residue corroboration: {residue:#?}");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::AuditFactoryAvailability => {
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            anyhow::ensure!(ramdisk::in_recovery() && cfg.device.codename == "OP5911"
+                && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot,
+                "factory availability audit requires PGZ110 Recovery");
+            let observed = skyward_install::factory_preflight::observe_restore_availability();
+            println!("{observed:#?}\nRead only. OEM merge state, full target claims and boot acceptance are not established here.");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::AuditPreloaderMaps => {
+            let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+            anyhow::ensure!(cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot,
+                "this UFS mapping audit is only for PGZ110 vendor_boot Recovery");
+            skyward_install::factory_preloader::audit_pgz110_211()?;
+            println!("OEM preloader mappings match the observed UFS geometry. Read-only audit; no write authorization.");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::PrepareFactoryA { package, my_company, my_preload, output_directory, avb_off, audit_targets, audit_physical_ab } =>
+            prepare_factory_a(&package, &my_company, &my_preload, &output_directory, avb_off, audit_targets, audit_physical_ab),
+        #[cfg(target_os = "android")]
+        Cmd::RestoreFactoryAbTest { package, my_company, my_preload, output_directory, avb_off, accept_both_slots_no_rollback } =>
+            restore_factory_ab_test(&package, &my_company, &my_preload, &output_directory, avb_off, accept_both_slots_no_rollback),
         Cmd::Mount => {
             let mounts = skyward_vab::mount_partitions(booted_slot()?)?;
             for d in &mounts.damaged {
@@ -833,6 +1022,10 @@ fn recovery() -> Result<()> {
         skyward_sys::set_prop("sys.usb.config", "adb")?;
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
+        #[cfg(target_os = "android")]
+        if lp_audit_requested(&message) {
+            return lp_maintenance_boot();
+        }
         let request = message.request();
         if !request.work.lasts() {
             bcb::clear(&misc)?;
@@ -922,6 +1115,59 @@ fn recovery() -> Result<()> {
     })
 }
 
+#[cfg(any(target_os = "android", test))]
+fn lp_audit_requested(message: &bcb::Bcb) -> bool {
+    message.command == "boot-recovery" && matches!(message.args.as_slice(), [arg] if arg == "--skyward-audit-lp")
+}
+
+/// A deliberately read-only boot. Never fall back to normal recovery on an
+/// audit error, because normal prepare maps vendor and invalidates the probe.
+#[cfg(target_os = "android")]
+fn lp_maintenance_boot() -> Result<()> {
+    use skyward_block::{BY_NAME, mount};
+    let report = (|| -> Result<String> {
+        // noload prevents ext4 journal replay even on a read-only mount.
+        let metadata = Path::new("/metadata");
+        if !mount::is_mount_point(metadata)? {
+            mount::mount(&Path::new(BY_NAME).join("metadata"), metadata, "ext4",
+                &["ro".into(), "noload".into(), "nodev".into(), "nosuid".into(), "noexec".into()])?;
+        }
+        let (capacity, snapshots, exclusive) = skyward_install::lp_capacity::audit_maintenance(booted_slot()?);
+        let boot = if exclusive.is_ok() {
+            (|| {
+                let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+                configure_binder(&cfg)?;
+                boot_services::observe_for_maintenance(&cfg, true)
+            })()
+        } else {
+            Err(anyhow::anyhow!("skipped: super could not be exclusively claimed"))
+        };
+        Ok(format!("capacity repair needed: {capacity:#?}\nsnapshot preflight: {snapshots:#?}\nread-only exclusive super / LP dry run: {exclusive:#?}\nOEM BootControl (next slot, merge state): {boot:#?}"))
+    })();
+    let text = match report { Ok(text) => text, Err(error) => format!("maintenance audit failed: {error:#}") };
+    eprintln!("{text}");
+    let _ = std::fs::write(Path::new(skyward_sys::RUN).join("lp-maintenance.txt"), format!("{text}\n"));
+    let _ = skyward_sys::kmsg("LP audit finished; Recovery is holding for ADB without preparing installed partitions");
+    // init restarts the normal Recovery service after exit; remain in this
+    // explicit diagnostic mode until the human chooses how to exit it.
+    loop { std::thread::park(); }
+}
+
+#[cfg(test)]
+#[test]
+fn lp_audit_does_not_take_over_standard_recovery_requests() {
+    for (command,args,expected) in [
+        ("boot-recovery", vec!["--skyward-audit-lp"], true),
+        ("boot-fastboot", vec!["--skyward-audit-lp"], false),
+        ("boot-recovery", vec!["--skyward-audit-lp", "--wipe_data"], false),
+        ("boot-recovery", vec!["--sideload"], false),
+        ("boot-recovery", vec![], false),
+    ] {
+        let message = bcb::Bcb { command: command.into(), args: args.into_iter().map(str::to_owned).collect() };
+        assert_eq!(lp_audit_requested(&message), expected);
+    }
+}
+
 /// Map and mount the slot's partitions from super, then bring up what runs
 /// from them, and give the programs the partitions name for the phone's
 /// keys, which the recovery keeps running from then on. Recovery has to
@@ -988,6 +1234,241 @@ fn info(config: &str) -> Result<()> {
     }
     let parts = skyward_block::list_by_name(skyward_block::BY_NAME)?;
     println!("partitions    = {} under {}", parts.len(), skyward_block::BY_NAME);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn open_repack_input(path: &Path, limit: u64) -> Result<(std::fs::File, u64)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let before = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(before.is_file() && before.len() <= limit, "need a bounded regular file: {}", path.display());
+    let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let opened = fd.metadata()?;
+    anyhow::ensure!(opened.is_file() && opened.len() == before.len(), "input changed while opening {}", path.display());
+    Ok((fd, opened.len()))
+}
+
+#[cfg(target_os = "android")]
+fn read_repack_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let (file, size) = open_repack_input(path, limit)?;
+    let mut bytes = Vec::new();
+    file.take(size + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 == size, "input size changed: {}", path.display());
+    Ok(bytes)
+}
+
+#[cfg(target_os = "android")]
+fn repack_donor() -> Result<(Vec<u8>, Vec<(&'static str, Vec<u8>)>)> {
+    let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+    anyhow::ensure!(cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot, "this repacker requires a PGZ110 vendor_boot Recovery");
+    let elf = read_repack_input(Path::new("/system/bin/recovery"), 32 << 20)?;
+    let mut owned = Vec::new();
+    for name in ["skyward/device.toml", "skyward/MiSansVF.ttf", "skyward/KirkMono-Regular.ttf", "skyward/KirkMono-OFL.txt", "system/etc/init/skyward-mtp.rc"] {
+        owned.push((name, read_repack_input(&Path::new("/").join(name), 32 << 20)?));
+    }
+    Ok((elf, owned))
+}
+
+#[cfg(target_os = "android")]
+fn prepare_avb_off_a(package: &Path, output_directory: &Path) -> Result<()> {
+    use skyward_install::{factory_preflight, payload_preflight, retention, signature};
+    use std::io::{BufReader, Write};
+
+    let (file, size) = open_repack_input(package, 128 << 30)?;
+    let mut zip = BufReader::new(file);
+    let (manifest, digest) = payload_preflight::read_zip_with_digest(&mut zip)?;
+    factory_preflight::reviewed_roster(&digest)?;
+    let keys = signature::keys(BufReader::new(open_repack_input(Path::new(signature::CERTIFICATES), 8 << 20)?.0))?;
+    anyhow::ensure!(signature::verify(&mut zip, size, &keys, |_, _| true)? == signature::Verdict::Signed,
+        "expected an official OTA signed by this Recovery's trusted certificates");
+    let (elf, owned) = repack_donor()?;
+    let assets: Vec<_> = owned.iter().map(|(name,data)| (*name,data.as_slice())).collect();
+    let prepared = retention::SlotTarget::from_payload(&manifest, skyward_vab::Slot::A)?.stage_from_payload(&mut zip, &manifest)?;
+    let pair = prepared.prepare_a_avb_off(&elf, &assets)?;
+    // A new directory and exclusively created regular files only. The marker
+    // is created last, so partial output is not identified as a complete pair.
+    std::fs::create_dir(output_directory)?;
+    for (name, bytes) in [("vendor_boot_a-UNTESTED.img", pair.vendor_boot.as_slice()), ("vbmeta_a-AVB-OFF-UNTESTED.img", pair.vbmeta.as_slice()),
+        ("PAIR-COMPLETE.txt", b"A-slot development candidates only. Modified vbmeta invalidates its OEM signature. Bootloader acceptance untested. No flash performed.\n".as_slice())] {
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(output_directory.join(name))?;
+        out.write_all(bytes)?;
+        out.sync_all()?;
+    }
+    println!("Prepared A-slot development pair at {}; no flash or slot change", output_directory.display());
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn audit_vendor_boot(package: &Path, staged: Option<&Path>, selected: &str) -> Result<()> {
+    use skyward_install::{payload_preflight, retention, vendor_boot::parent_avb::ParentBinding};
+    use skyward_vab::Slot;
+    let slot = match selected { "a" => Slot::A, "b" => Slot::B, _ => anyhow::bail!("slot must be a or b") };
+    let (mut zip, _) = open_repack_input(package, 128 << 30)?;
+    let manifest = payload_preflight::read_zip(&mut zip)?;
+    let target = retention::SlotTarget::from_payload(&manifest, slot)?;
+    let prepared = if let Some(staged) = staged {
+        target.validate_sources(|s, name| open_repack_input(&staged.join(format!("{name}{}.img", s.suffix())), 128 << 20))?
+    } else {
+        target.stage_from_payload(&mut zip, &manifest)?
+    };
+    let (elf, owned) = repack_donor()?;
+    let assets: Vec<_> = owned.iter().map(|(name,data)| (*name,data.as_slice())).collect();
+    match prepared.audit_repack(&elf, &assets)? {
+        ParentBinding::MatchesCandidate => println!("slot {} parent descriptor matches candidate; OEM authorization not established", prepared.slot().suffix()),
+        ParentBinding::RejectsCandidate => anyhow::bail!("slot {} unchanged parent vbmeta binds the original image, not the repacked candidate", prepared.slot().suffix()),
+        ParentBinding::Unproven => anyhow::bail!("slot {} parent AVB binding is unproven", prepared.slot().suffix()),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn prepare_vendor_boot(stock: &Path, output: &Path) -> Result<()> {
+    use std::io::Write;
+    let target = read_repack_input(stock, 64 << 20)?;
+    let (elf, owned) = repack_donor()?;
+    let assets: Vec<_> = owned.iter().map(|(name, data)| (*name, data.as_slice())).collect();
+    let result = skyward_install::vendor_boot::repack(&target, &elf, &assets)?;
+    // This stage emits a new file only. It cannot open an existing device or
+    // output path and cannot select a slot, activate it, or write vbmeta.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
+    file.write_all(&result)?;
+    file.sync_all()?;
+    println!("Prepared {} bytes at {} (unverified runtime candidate; not flashed)", result.len(), output.display());
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn preflight_ota(package: &Path, company: &Path, preload: &Path, verify_official: bool) -> Result<()> {
+    use skyward_install::{factory_preflight, payload_preflight as ota, signature, super_replacement};
+    let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+    anyhow::ensure!(cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot, "this preflight is for PGZ110 vendor_boot Recovery");
+    let (mut package, package_size) = open_repack_input(package, 128 << 30)?;
+    let (manifest, digest) = ota::read_zip_with_digest(&mut package)?;
+    let super_path = Path::new(skyward_block::BY_NAME).join("super");
+    let bytes = skyward_block::size_bytes(&super_path)?;
+    let lp = skyward_lp::read(&super_path, booted_slot()?.number())?;
+    let [device] = lp.block_devices.as_slice() else { anyhow::bail!("expected one physical super device"); };
+    anyhow::ensure!(lp.damaged.is_empty() && device.partition_name == "super" && bytes == device.size, "physical super disagrees with verified LP metadata");
+    let data_start = device.first_logical_sector.checked_mul(skyward_lp::SECTOR_SIZE).context("super sector overflow")?;
+    let g = ota::Geometry { device_size: bytes, data_start, alignment: u64::from(device.alignment),
+        alignment_offset: u64::from(device.alignment_offset), logical_block: u64::from(lp.geometry.logical_block_size) };
+    let company_size = super_replacement::inspect(company)?;
+    let preload_size = super_replacement::inspect(preload)?;
+    let plan = ota::preview(&manifest, g, company_size, preload_size)?;
+    println!("READ-ONLY: no flash, no AVB changes, no slot switch");
+    if verify_official {
+        let roster = factory_preflight::reviewed_roster(&digest)?;
+        let certs = std::io::BufReader::new(open_repack_input(Path::new(signature::CERTIFICATES), 8 << 20)?.0);
+        let keys = signature::keys(certs)?;
+        let verdict = signature::verify(&mut package, package_size, &keys, |_, _| true)?;
+        anyhow::ensure!(verdict == signature::Verdict::Signed, "official OTA signature is not established: {verdict:?}");
+        let checked = factory_preflight::check(&manifest, true, &lp, bytes, roster,
+            factory_preflight::ReplacementSizes { my_company: company_size, my_preload: preload_size })?;
+        println!("Verified official ZIP signature and reviewed .211 inventory: {} images declared, {} A partitions; allocation ends at byte {}",
+            checked.original_images.len(), checked.effective_a_sizes.len(), checked.allocated_end);
+        println!("External replacements absent from OTA: {:?}; OEM signature does not cover their bytes", checked.replacements_without_original);
+        let boot_chain = skyward_install::retention::SlotTarget::from_payload(&manifest, skyward_vab::Slot::A)?
+            .stage_from_payload(&mut package, &manifest)?;
+        let (elf, owned) = repack_donor()?;
+        let assets: Vec<_> = owned.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+        let binding = boot_chain.audit_repack(&elf, &assets)?;
+        println!("A-slot candidate binding against untouched parent vbmeta: {binding:?}; not boot authorization");
+    }
+    println!("Partial OTA: {}; payload snapshots: {}; physical super: {bytes} bytes", plan.partial, plan.snapshot_enabled);
+    for item in &plan.only_a.slot[0] { println!("{:<16} {:>12} {:?}", item.name, item.bytes, item.origin); }
+    println!("A only: {} bytes including alignment; fits physical={}; target group limit={:?}", plan.only_a.aligned_end, plan.only_a.fits(), plan.group_limit);
+    println!("Independent A and B: {} bytes including alignment; fits physical={}", plan.two_copies.aligned_end, plan.two_copies.fits());
+    println!("Not in target dynamic group: {:?}", plan.physical_payload_names);
+    let device_number = skyward_block::devnum(&super_path)?;
+    let kernel_holders = skyward_install::factory_preflight::kernel_super_holders(Path::new("/sys/dev/block"), device_number)?;
+    let super_mounts = skyward_block::mount::points_of(device_number)?;
+    let snapshot = skyward_vab::snapshot_state()?;
+    println!("Whole-super write preconditions (read-only): snapshot={snapshot:?}, direct mounts={super_mounts:?}, kernel holders={kernel_holders:?}");
+    if snapshot != skyward_vab::SnapshotState::None || !super_mounts.is_empty() || !kernel_holders.is_empty() {
+        println!("Shared super is not clear for full-device replacement.");
+    }
+    println!("No authorization to write or switch slots: AVB compatibility and completeness of target layout are not established by this preview.");
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn prepare_super_a(package: &Path, company: &Path, preload: &Path, output: &Path) -> Result<()> {
+    let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+    anyhow::ensure!(cfg.device.codename == "OP5911" && cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot,
+        "this candidate builder requires PGZ110 vendor_boot Recovery");
+    use skyward_install::{factory_preflight, payload_preflight, signature, super_replacement};
+    let (file, input_size) = open_repack_input(package, 128 << 30)?;
+    let mut input = std::io::BufReader::new(file);
+    let (payload, digest) = payload_preflight::read_zip_with_digest(&mut input)?;
+    let roster = factory_preflight::reviewed_roster(&digest)?;
+    let super_path = Path::new(skyward_block::BY_NAME).join("super");
+    let bytes = skyward_block::size_bytes(&super_path)?;
+    let metadata = skyward_lp::read(&super_path, booted_slot()?.number())?;
+    let replacements = factory_preflight::ReplacementSizes {
+        my_company: super_replacement::inspect(company)?, my_preload: super_replacement::inspect(preload)?,
+    };
+    let certs = std::io::BufReader::new(open_repack_input(Path::new(signature::CERTIFICATES), 8 << 20)?.0);
+    let keys = signature::keys(certs)?;
+    let verdict = signature::verify(&mut input, input_size, &keys, |_, _| true)?;
+    anyhow::ensure!(verdict == signature::Verdict::Signed, "official OTA signature is not established: {verdict:?}");
+    let _ = factory_preflight::check(&payload, true, &metadata, bytes, roster, replacements)?;
+    let result = skyward_install::super_image::build_a(&mut input, &payload, &metadata, bytes, company, preload, output)?;
+    println!("Prepared {} bytes at {} ({} A-slot partitions; allocated through byte {}; partial payload: {}). No flashing, AVB change, or slot switch.",
+        result.bytes, output.display(), result.partitions, result.allocated_end, result.partial_payload);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn prepare_factory_a(package: &Path, company: &Path, preload: &Path, output: &Path, avb_off: bool, audit_targets: bool, audit_physical_ab: bool) -> Result<()> {
+    let (elf, owned) = repack_donor()?;
+    let assets: Vec<_> = owned.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+    let super_path = Path::new(skyward_block::BY_NAME).join("super");
+    let bytes = skyward_block::size_bytes(&super_path)?;
+    let metadata = skyward_lp::read(&super_path, booted_slot()?.number())?;
+    let bundle = skyward_install::factory_bundle::prepare(package,
+        Some(Path::new(skyward_install::signature::CERTIFICATES)), &metadata, bytes,
+        company, preload, &elf, &assets, avb_off, output)?;
+    println!("Staged {} files at {}; this did not write partitions or switch slots",
+        bundle.images.len() + bundle.extra_physical.len(), bundle.directory.display());
+    println!("Unstaged: {:?}; staged but without a verified execution mapping: {:?}",
+        bundle.remaining_physical, bundle.unmapped_physical);
+    if let Err(error) = bundle.execution_plan() {
+        println!("Not an executable restore: {error:#}");
+    }
+    if audit_targets || audit_physical_ab {
+        let count = if audit_physical_ab { bundle.audit_targets_ab()? } else { bundle.audit_targets()? };
+        println!("Read-only exclusive claims succeeded for {count} targets and were released. No flash or boot authorization.");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn restore_factory_ab_test(package: &Path, company: &Path, preload: &Path, output: &Path,
+    avb_off: bool, accept_both_slots_no_rollback: bool) -> Result<()> {
+    anyhow::ensure!(accept_both_slots_no_rollback, "explicit both-slot/no-rollback acknowledgment is required");
+    anyhow::ensure!(avb_off, "the .211 Skyward test changes vendor_boot and requires explicit AVB-off selection");
+    anyhow::ensure!(skyward_sys::prop("ro.boot.vbmeta.device_state").as_deref() == Some("unlocked")
+        && skyward_sys::prop("ro.boot.verifiedbootstate").as_deref() == Some("orange"),
+        "the bootloader must explicitly report unlocked/orange; this does not prove AVB-off boot acceptance");
+    anyhow::ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None,
+        "a pending or unknown snapshot state prevents this test");
+    skyward_install::factory_preflight::audit_restore_metadata().context("restore requires idle snapshot metadata before staging")?;
+    let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+    let (elf, owned) = repack_donor()?;
+    let assets: Vec<_> = owned.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+    let super_path = Path::new(skyward_block::BY_NAME).join("super");
+    let bytes = skyward_block::size_bytes(&super_path)?;
+    let reference = skyward_lp::read(&super_path, booted_slot()?.number())?;
+    // Reject a mounted or held super before spending time materializing
+    // the package; the backend still claims all destinations again.
+    skyward_install::with_exclusive_super_for_audit(|_| Ok(()))?;
+    let bundle = skyward_install::factory_bundle::prepare(package,
+        Some(Path::new(skyward_install::signature::CERTIFICATES)), &reference, bytes,
+        company, preload, &elf, &assets, avb_off, output)?;
+    println!("Staging complete. Experimental restore: both physical slots, one shared super with A only.");
+    boot_services::execute_ab_test(&cfg, &bundle)?;
+    println!("All scheduled writes synced. OEM BootControl accepted A as the next slot. No reboot requested.");
     Ok(())
 }
 

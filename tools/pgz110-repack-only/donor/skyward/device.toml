@@ -1,0 +1,107 @@
+# Experimental Skyward port; NOT a tested recovery release.
+# Base: PGZ110_15.0.0.1600(CN01), Android 15, project 22801.
+# Native Skyward schema at c5e09f6eb644e75e051b309f98d6745ccbc97d81.
+[device]
+codename = "OP5911"
+brand = "OnePlus"
+model = "PGZ110"
+ab = true
+# Requires bundled Skyward patch; stock upstream does not read this field.
+recovery_partition = "vendor_boot"
+# Stock PGZ110 Recovery libbinder uses Parcel SYST, not the RECO build marker.
+binder_header = "system"
+# Stock fastboot's HIDL directory is UID0; binder remembers that UID until reboot.
+# Use the same UID for the installed directory, in either entry order.
+hidl_manager_root = true
+auto_open_data = true
+soc = { hans = "天玑 8100-MAX", hant = "天璣 8100-MAX", en = "Dimensity 8100-MAX" }
+model_prop = "ro.product.name"
+os_version_prop = "ro.build.display.ota"
+
+[display]
+# Keep dimensions autodetected. Density comes from stock ramdisk prop.default.
+# Do not assume a panel variant merely from the SoC/model name.
+width = 0
+height = 0
+density = 480
+clock_offset_dp = 20
+# MTK Tianma path: restore the last successful running mode in one modeset.
+# Other devices keep the default preferred-then-fastest compatibility path.
+resume_mode = "running"
+
+[modules]
+# Stock first stage already has modules.load.recovery and all panel/touch modules.
+# Do not load guessed touchscreen modules or Qualcomm Wi-Fi drivers.
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = []
+
+# Stock init already starts touchDaemon and Oplus touch AIDL service.
+# Do NOT start duplicate touch services here.
+[partitions]
+mounted = []
+
+[backup]
+efs = ["nvram", "nvdata", "nvcfg", "protect1", "protect2", "persist"]
+# These are deliberately conservative exclusions; review actual TEE storage
+# on the device before any backup restore. Never restore RPMB/TEE state.
+data_skipped = ["vendor/mcRegistry", "vendor/tee", "vendor/keymaster", "vendor/gatekeeper"]
+
+# No [stock]: upstream "stock" extracts a hard-coded recovery partition,
+# whereas this phone embeds recovery in vendor_boot. Use tools/extract_ota.py.
+# No [update]: upstream online ROM queries are Xiaomi-specific.
+# Haptics uses the audited AW8697 LED-class backend below.
+# WLAN is configured below from stock MTK init/module/character-device evidence.
+# KeyMint/Gatekeeper descriptors must come from the installed ROM, NOT Android
+# version overrides or another device's vendor blobs. See README.zh-CN.md.
+
+# Required by this device's Trustonic KeyMint. Uses the existing persistent
+# secure store only; no --sfs-reformat, no store creation/reset or restart loop.
+# Fresh Recovery metadata checks confirmed system-owned nonempty Store_1.tf.
+[trustonic]
+allow_persistent_writes = true
+libraries = ["/system/lib64", "/vendor/lib64"]
+
+
+# MTK conninfra + connac2 power control; no shared connectivity modules unloaded.
+[wlan]
+protocol = "hidl"
+modules = ["wmt_chrdev_wifi_connac2", "wlan_drv_gen4m_6895"]
+# Register BT only AFTER the existing Wi-Fi calibration buffer reaches RAM.
+calibration_modules = ["bt_drv_6895"]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+service = "android.hardware.wifi.supplicant@1.4::ISupplicant/default"
+probe = "http://connectivitycheck.gstatic.com/generate_204"
+
+[wlan.bootstrap]
+modules = ["conninfra"]
+program = "/vendor/bin/conninfra_loader"
+ready_property = "vendor.connsys.driver.ready"
+ready_value = "yes"
+libraries = ["/system/lib64", "/vendor/lib64"]
+
+[wlan.power]
+path = "/dev/wmtWifi"
+on = "1"
+off = "0"
+
+[wlan.nvram]
+partition = "nvdata"
+directory = "APCFG/APRDEB"
+file = "WIFI"
+selector = "/data/vendor/nvramwifi"
+device = "/dev/wmtWifi"
+
+
+# Audited AW8697 815 LED-class driver; no input force-feedback device exists.
+[haptics]
+backend = "aw8697_led"
+resonance = "/sys/class/leds/vibrator/f0"
+strength = { lightest = 0.25, strongest = 0.75 }
+
+[haptics.led]
+path = "/sys/class/leds/vibrator"
+click_ms = 18
+ticks_ms = 30
+max_gain = 128

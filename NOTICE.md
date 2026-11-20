@@ -28,6 +28,12 @@ Updated the PGZ110 recovery source for secure-service and VNDK handling, Android
 
 本次更新了 PGZ110 的安全服务与 VNDK 处理、此前未设置屏幕锁的 Android 12 设备存储兼容逻辑、Wi-Fi 模块加载规划、设备及电池信息，以及恢复出厂设置的规划和安全检查。此次只更新源码，未替换已发布的 `qqcandy-1600-userdebug` 镜像，也不代表增加了已验证的固件支持。
 
+## Source update / 源码更新 — 2026-11-21
+
+Added the official full-package (factory bundle) install path, the in-recovery OTA catalogue and downloader, the PGZ110 vendor_boot repacker used to port the running Skyward into the target system version, the AVB-off preparation for that path, the single-A payload/super planning modules, and the Android porter tool under `tools/mobile-porter`. The bundle is restricted to the PGZ110 layouts it was audited against and requires an unlocked bootloader.
+
+本次新增官方全量包（factory bundle）安装流程、Recovery 内的 OTA 目录与下载器、用于把当前 Skyward 移植进目标系统版本的 PGZ110 vendor_boot 重打包模块、该流程所需的 AVB 关闭准备、单 A 载荷与 super 规划模块，以及 `tools/mobile-porter` 手机端移植工具。该流程仅适用于已审查的 PGZ110 布局，并要求 Bootloader 已解锁。
+
 ## Fonts / 字体
 
 - **MiSans**: Xiaomi / 小米科技有限责任公司. Used unchanged for Skyward's interface as a project resource, not distributed separately or relicensed as GPL. See [MiSans-LICENSE.txt](resources/fonts/MiSans-LICENSE.txt), which reproduces the Chinese and English agreement from https://hyperos.mi.com/font/download and https://hyperos.mi.com/font/en/download/ (retrieved 2026-11-16). The application already contains a MiSans attribution in its font information/about UI. / 原样用于 Skyward 界面，不单独分发，不重新授权为 GPL；程序字体信息/关于界面中已有 MiSans 使用声明。

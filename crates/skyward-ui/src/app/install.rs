@@ -80,6 +80,8 @@ pub enum Install {
     /// An update waits for the user to agree: the version it brings, and
     /// whether all user data is erased after it.
     Confirming { version: Option<String>, wipe: bool },
+    /// An authenticated factory restore waits for explicit overwrite consent.
+    ConfirmingFactory { version: Option<String> },
     /// `overwriting` says whether the update writes over the running
     /// system.
     Updating { version: Option<String>, stage: Option<Stage>, overwriting: bool },
@@ -221,7 +223,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::FactoryReady { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -229,6 +231,7 @@ impl App {
             Event::Waiting => *install = Install::Waiting,
             Event::Checking { size } => *install = Install::Checking { size, stage: None },
             Event::Ready { version, wipe } => *install = Install::Confirming { version, wipe },
+            Event::FactoryReady { version } => *install = Install::ConfirmingFactory { version },
             Event::Installing { version } => *install = Install::Updating { version, stage: None, overwriting: false },
             Event::Overwriting => {
                 if let Install::Updating { overwriting, .. } = install {
@@ -291,6 +294,12 @@ impl App {
         let source = Source::Opened { drive: std::path::Path::new(&path).starts_with(USB_DRIVE) };
         let name = file_name(&path);
         self.install_named(source, name, size, Effect::InstallPath(path), now)
+    }
+
+    /// Present a descriptor-based resumed local install without a path effect.
+    pub fn show_resumed_local_ota(&mut self, size: u64) {
+        self.begin_install(Install::Checking { size, stage: None }, Source::Opened { drive: false }, None);
+        self.open(Screen::Installing);
     }
 
     /// Install the file `name` of `size` bytes from `source`, `start` asking
@@ -439,6 +448,37 @@ mod tests {
     }
 
     #[test]
+    fn factory_restore_waits_for_explicit_overwrite_consent_and_can_cancel() {
+        let (f, i) = (fonts(), info());
+        let local = || {
+            let mut app = opened(Screen::Install, &f, &i);
+            app.data_waiting(None);
+            tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
+            app.set_place(Place::Storage, String::new(), Ok(vec![entry("official.zip", FileKind::File)]), LISTED);
+            assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::InstallFile(Place::Storage, "official.zip".into())]);
+            app
+        };
+        let version = Some(".211".into());
+        let mut app = local();
+        app.install(Event::FactoryReady { version: version.clone() }, 0);
+        assert_eq!(app.state.install, Install::ConfirmingFactory { version: version.clone() });
+        let (label, danger) = crate::pages::confirm_label(Confirm::Install, &app.state);
+        assert!(danger && label.contains('A'));
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::Install)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.state.install, Install::Updating { version, stage: None, overwriting: false });
+
+        let mut app = local();
+        app.install(Event::FactoryReady { version: None }, 0);
+        assert_eq!(app.key(Key::Back, 1000), vec![Effect::Cancel]);
+        assert_eq!(app.state.install, Install::Ending);
+        assert_ne!(app.screen(), Screen::Installing);
+    }
+
+    #[test]
     fn a_zip_runs_its_install_script_once_agreed_to_and_shows_what_it_says() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
@@ -530,6 +570,55 @@ mod tests {
         assert!(app.state.keep_recovery, "on until turned off");
         tap(&mut app, &f, &i, Action::Toggle(Switch::KeepRecovery));
         assert!(!app.state.keep_recovery);
+    }
+
+    #[test]
+    fn pgz110_can_use_the_same_recovery_toggle_without_standalone_partitions() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Install, &f, &i);
+        app.state.vendor_boot_retention = true;
+        app.state.keep_recovery = false;
+        app.refresh();
+        let action = Action::Toggle(Switch::KeepRecovery);
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == action));
+        tap(&mut app, &f, &i, action);
+        assert!(app.state.keep_recovery);
+        assert!(!app.state.recovery_partitions);
+    }
+
+    #[test]
+    fn pgz110_avb_choice_is_not_hidden_or_overridden_by_retention() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Install, &f, &i);
+        let avb = Action::Toggle(Switch::DisableAvb);
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == avb);
+        app.state.keep_recovery = false;
+        app.refresh();
+        assert!(!offered(&mut app));
+        assert!(!app.state.install_disable_avb());
+        assert!(app.state.disable_avb);
+        app.state.vendor_boot_retention = true;
+        app.state.check_signature = true;
+        app.refresh();
+        assert!(offered(&mut app));
+        assert!(app.state.install_disable_avb());
+        tap(&mut app, &f, &i, avb);
+        assert!(!app.state.install_disable_avb());
+        assert!(app.state.check_signature);
+        assert!(!app.state.keep_recovery);
+        tap(&mut app, &f, &i, avb);
+        tap(&mut app, &f, &i, Action::Toggle(Switch::KeepRecovery));
+        assert!(app.state.keep_recovery);
+        app.state.disable_avb = false; // Simulate an older saved preference.
+        app.refresh();
+        assert!(!offered(&mut app), "forced switch has no tap target");
+        assert!(app.state.install_disable_avb());
+        app.act(avb, 1000);
+        assert!(app.state.install_disable_avb(), "even direct actions cannot disable required AVB-off");
+        assert!(!app.state.disable_avb, "independent saved preference is retained");
+        tap(&mut app, &f, &i, Action::Toggle(Switch::KeepRecovery));
+        assert!(offered(&mut app));
+        assert!(!app.state.install_disable_avb());
     }
 
     #[test]

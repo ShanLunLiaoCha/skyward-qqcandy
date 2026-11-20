@@ -56,6 +56,8 @@ impl App {
                     Switch::Verify => &mut self.state.verify,
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
+                    Switch::DisableAvb if self.state.offers_disable_avb() && !self.state.avb_forced_by_retention() => &mut self.state.disable_avb,
+                    Switch::DisableAvb => return Vec::new(),
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
@@ -98,6 +100,10 @@ impl App {
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
             Action::Slider(_) | Action::Pattern => {}
+            Action::SelectOta(package) => return self.select_ota(package, now),
+            Action::RetryOta => return self.retry_ota(now),
+            Action::CancelOta => return self.cancel_ota(),
+            Action::InstallOta => return self.install_ota(now),
             Action::Sideload => match self.state.install {
                 Install::Idle | Install::Finished { .. } => {
                     self.begin_install(Install::Starting, Source::Computer, None);
@@ -710,8 +716,13 @@ impl App {
                 }
             }
             Confirm::Install | Confirm::InstallWipe => {
-                if let Install::Confirming { version, .. } = &self.state.install {
-                    self.state.install = Install::Updating { version: version.clone(), stage: None, overwriting: false };
+                let version = match &self.state.install {
+                    Install::Confirming { version, .. } => Some(version.clone()),
+                    Install::ConfirmingFactory { version } if which == Confirm::Install => Some(version.clone()),
+                    _ => None,
+                };
+                if let Some(version) = version {
+                    self.state.install = Install::Updating { version, stage: None, overwriting: false };
                     fx.push(Effect::Install);
                     self.refresh();
                 }

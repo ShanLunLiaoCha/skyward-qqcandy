@@ -38,6 +38,8 @@ pub enum Task {
     /// Download `release`'s full package to `path`; `server` is asked again
     /// for where it is when the addresses it gave have run out.
     Download { server: String, installed: Installed, release: Release, path: PathBuf },
+    /// Download one selected preset as a file; never launch an installer.
+    DownloadOta { url: &'static str, path: PathBuf },
     /// Ask GitHub for Skyward's newest release and its zip for the phone
     /// `codename` names; where that fails, `probe` says whether the network
     /// is why.
@@ -133,6 +135,28 @@ impl Worker {
                     };
                     let sum = Sum::Md5(release.md5.clone());
                     let end = fetch(&servers, release.urls.clone(), &sum, &release.name, &path, &stopping, &using, &tell, &mut refused);
+                    tell(Event::Ended(end));
+                }
+                Task::DownloadOta { url, path } => {
+                    let a = http::agent(servers);
+                    *using.lock().expect("download agent lock poisoned") = Some(a.clone());
+                    let mut last = Instant::now() - PROGRESS_EVERY;
+                    let result = skyward_net::ota_download::fetch(&a, url, &path, &stopping, &mut |progress| {
+                        if last.elapsed() >= PROGRESS_EVERY {
+                            last = Instant::now();
+                            tell(Event::Progress(progress, 0));
+                        }
+                    });
+                    let end = match result {
+                        Ok(()) => End::Downloaded,
+                        Err(e) if e.is::<skyward_net::Stopped>() || stopping.load(Ordering::Relaxed) => End::Stopped,
+                        Err(e) => {
+                            let reason = if let Some(room) = e.downcast_ref::<NoRoom>() {
+                                Failure::NoRoom { needed: room.needed, free: room.free }
+                            } else { Failure::Other(format!("{e:#}")) };
+                            End::Failed(reason)
+                        }
+                    };
                     tell(Event::Ended(end));
                 }
                 Task::CheckSkyward { probe, codename } => {

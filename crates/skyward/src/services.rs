@@ -731,6 +731,120 @@ fn verified_init_pid(service: &str, executable: &str) -> Result<u32> {
     Ok(pid)
 }
 
+/// Retire the two audited PGZ110 init services before releasing old LP mounts.
+/// Call from the quiesced Recovery handoff, while their executable paths still
+/// resolve to the running files. A failure can leave one service stopped, so
+/// callers must abort the handoff rather than attempt a blind restart.
+#[cfg(target_os = "android")]
+pub fn retire_for_lp_handoff() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    struct Original {
+        service: &'static str,
+        executable: &'static str,
+        pid: u32,
+        starttime: u64,
+        file: (u64, u64),
+        pidfd: OwnedFd,
+    }
+
+    fn executable_inode(path: &Path) -> Result<(u64, u64)> {
+        let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        ensure!(meta.is_file(), "{} is not a regular executable", path.display());
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    impl Original {
+        fn inspect(service: &'static str, executable: &'static str) -> Result<Self> {
+            let pid = verified_init_pid(service, executable)?;
+            let number = i32::try_from(pid).context("init PID exceeds pid_t")?;
+            let starttime = Process::new(number)?.stat()?.starttime;
+            let file = executable_inode(Path::new(executable))?;
+            // Pin the original process for a bounded exit check, without
+            // sending signals. Recheck identity after opening the pidfd.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+            if fd < 0 { return Err(io::Error::last_os_error()).with_context(|| format!("pin original {service} PID {pid}")); }
+            let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+            let original = Self { service, executable, pid, starttime, file, pidfd };
+            original.recheck_running()?;
+            Ok(original)
+        }
+
+        fn exited(&self) -> Result<bool> {
+            let mut fd = libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            loop {
+                let n = unsafe { libc::poll(&mut fd, 1, 0) };
+                if n >= 0 {
+                    ensure!(fd.revents & !(libc::POLLIN | libc::POLLHUP) == 0, "unexpected pidfd events for {}", self.service);
+                    return Ok(fd.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted { return Err(error).context("poll original init service"); }
+            }
+        }
+
+        fn recheck_running(&self) -> Result<()> {
+            ensure!(!self.exited()? && verified_init_pid(self.service, self.executable)? == self.pid
+                && Process::new(i32::try_from(self.pid)?)?.stat()?.starttime == self.starttime
+                && executable_inode(Path::new(self.executable))? == self.file
+                && executable_inode(Path::new(&format!("/proc/{}/exe", self.pid)))? == self.file
+                && !self.exited()?, "original {} changed during handoff", self.service);
+            Ok(())
+        }
+
+        fn stopped(&self) -> Result<bool> {
+            let state = skyward_sys::prop(&format!("init.svc.{}", self.service));
+            let reported = skyward_sys::prop(&format!("init.svc_debug_pid.{}", self.service));
+            let no_pid = matches!(reported.as_deref(), None | Some("" | "0"));
+            if !no_pid {
+                ensure!(reported.as_deref() == Some(self.pid.to_string().as_str()), "{} was replaced during handoff", self.service);
+            }
+            if self.exited()? && state.as_deref() == Some("stopped") && no_pid {
+                // Verify the pair again on the same side of the pinned
+                // exit observation; a concurrent restart is not success.
+                let state_now = skyward_sys::prop(&format!("init.svc.{}", self.service));
+                let pid_now = skyward_sys::prop(&format!("init.svc_debug_pid.{}", self.service));
+                ensure!(state_now == state && pid_now == reported, "{} changed while checking stopped state", self.service);
+                return Ok(true);
+            }
+            ensure!(matches!(state.as_deref(), Some("running" | "stopping" | "stopped")),
+                "unexpected init state for {}: {state:?}", self.service);
+            // A property can still say running while init reaps the
+            // original child. Never accept it as stopped until both the
+            // pidfd and the final init properties agree.
+            Ok(false)
+        }
+    }
+
+    let config = skyward_config::DeviceConfig::load(Path::new("/").join(skyward_config::ramdisk::CONFIG))?;
+    ensure!(config.device.codename == "OP5911" && config.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot,
+        "LP service handoff requires the PGZ110 vendor_boot Recovery");
+    // Read-only prevalidation of both owners before issuing any ctl.stop.
+    let originals = [
+        Original::inspect("healthd", "/system/bin/android.hardware.health@2.1-service")?,
+        Original::inspect("vndservicemanager", "/vendor/bin/vndservicemanager")?,
+    ];
+    ensure!(originals[0].pid != originals[1].pid, "init services unexpectedly share a PID");
+    for original in &originals { original.recheck_running()?; }
+    for (index, original) in originals.iter().enumerate() {
+        for stopped in &originals[..index] {
+            ensure!(stopped.stopped()?, "{} started again during handoff", stopped.service);
+        }
+        original.recheck_running()?;
+        skyward_sys::set_prop("ctl.stop", original.service)
+            .with_context(|| format!("ask init to stop {}", original.service))?;
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while !original.stopped()? {
+            ensure!(Instant::now() < deadline, "timed out waiting for original {} to exit and init to report stopped", original.service);
+            thread::sleep(READY_POLL);
+        }
+    }
+    for original in &originals {
+        ensure!(original.stopped()?, "{} did not remain stopped", original.service);
+    }
+    Ok(())
+}
+
 fn pin_files(files: BTreeSet<PathBuf>, mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
     let mut busy: Vec<PathBuf> = Vec::new();
     for file in files {

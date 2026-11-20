@@ -11,6 +11,27 @@ pub const DIRECTORIES: [&str; 6] = [
 pub fn find(name: &str, roots: impl IntoIterator<Item=impl AsRef<Path>>) -> Option<PathBuf> {
     roots.into_iter().map(|root| root.as_ref().join(format!("{name}.apex"))).find(|file| file.is_file())
 }
+/// The newest versioned VNDK bundle the installed partitions carry. Used
+/// when the running Recovery has no ro.vndk.version to name one; the phone
+/// itself always has exactly one such bundle.
+pub fn discover_vndk() -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for root in DIRECTORIES.map(Path::new) {
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix("com.android.vndk.v") else { continue };
+            let Some(version) = rest.strip_suffix(".apex") else { continue };
+            if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit()) { continue }
+            let Ok(number) = version.parse::<u32>() else { continue };
+            if best.as_ref().is_none_or(|(seen, _)| number > *seen) {
+                best = Some((number, format!("com.android.vndk.v{version}")));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 /// Prefer the exact versioned name in the normal search order. A present
 /// but invalid versioned object is an error, not a reason to fall back.
 /// The second result marks `current` so the caller must check its manifest.

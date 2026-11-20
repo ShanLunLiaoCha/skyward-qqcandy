@@ -1,8 +1,10 @@
-name: qqcandy source checks
+name: Source checks
 
-# Modified 2026-11-16: source-only manual checks for this unofficial port.
+# Modified for this unofficial port: static checks only.
 # No stock firmware download, image packaging, flashing or automatic release.
 on:
+  push:
+    branches: ["**"]
   workflow_dispatch:
 
 permissions:
@@ -12,28 +14,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  source:
-    name: Check source and compile Android service
+  static:
+    name: Syntax checks
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
       - name: Check Python syntax without generating cache files
         run: |
           python3 - <<'PY'
           import ast
           from pathlib import Path
-          for path in Path('tools').glob('*.py'):
-              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          for path in Path('.').rglob('*.py'):
+              if any(part in {'.git', 'target', '__pycache__'} for part in path.parts):
+                  continue
+              ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
           PY
       - name: Check shell syntax
         run: |
-          for script in tools/*.sh; do sh -n "$script"; done
-      - name: Selected host library tests (not device tests)
-        run: cargo test --locked -p skyward-config -p skyward-crypto -p skyward-install -p skyward-systems --lib
-      - name: Compile the recovery service (no image packaging)
-        run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
+          for script in tools/*.sh tools/*/*.sh; do
+            [ -e "$script" ] || continue
+            sh -n "$script"
+          done

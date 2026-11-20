@@ -90,6 +90,10 @@ impl App {
         let left = self.screen();
         match left {
             Screen::Mount => self.state.mount_failure = None,
+            Screen::OtaDownload if self.state.ota_download.as_ref().is_some_and(OtaDownload::active) => {
+                self.say(l.pick(WAIT_OR_STOP), now);
+                return fx;
+            }
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
             // So is a system; the page stays while the boot partitions are
@@ -241,6 +245,7 @@ impl App {
                 | Install::Choosing(_)
                 | Install::SystemChoosing(_)
                 | Install::Confirming { .. }
+                | Install::ConfirmingFactory { .. }
                 | Install::ConfirmingScript => {
                     self.state.install = Install::Ending;
                     fx.push(Effect::Cancel);

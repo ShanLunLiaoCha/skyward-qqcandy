@@ -101,7 +101,14 @@ impl<'a> BootControl<'a> {
             let control = service::find(binder, SERVICE)?.with_context(|| not_running(SERVICE))?;
             return Ok(BootControl::Newer(control));
         }
-        let control = hidl::find(hardware, HARDWARE_SERVICE, INSTANCE)?.with_context(|| not_running(HARDWARE_SERVICE))?;
+        Self::open_hidl12(hardware)
+    }
+
+    /// Open exactly the OEM HIDL 1.2 service. Recovery's isolated restore
+    /// diagnostics must not fall back to an installed AIDL service manager.
+    pub fn open_hidl12(hardware: &'a Binder) -> Result<BootControl<'a>> {
+        let control = hidl::find(hardware, HARDWARE_SERVICE, INSTANCE)?
+            .with_context(|| format!("{HARDWARE_SERVICE} is not running; the phone's boot control has to be started first"))?;
         Ok(BootControl::Older(control))
     }
 

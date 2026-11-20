@@ -16,17 +16,19 @@ skyward-block = { path = "../skyward-block" }
 skyward-vab = { path = "../skyward-vab" }
 skyward-modules = { path = "../skyward-modules" }
 skyward-info = { path = "../skyward-info" }
-skyward-install = { path = "../skyward-install" }
+skyward-install = { path = "../skyward-install", features = ["lz4-sys"] }
 skyward-sys = { path = "../skyward-sys" }
 skyward-lp = { path = "../skyward-lp" }
 
 [dev-dependencies]
+procfs = { version = "0.18.0", default-features = false }
 skyward-ui = { path = "../skyward-ui" }
 tempfile = "3.27.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = { version = "0.14.3", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
+tempfile = "3.27.0"
 evdev = "0.13.2"
 hex = { workspace = true }
 skyward-backup = { path = "../skyward-backup" }

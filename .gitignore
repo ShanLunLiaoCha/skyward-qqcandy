@@ -19,7 +19,6 @@ notes/
 # Local build, firmware, validation and sensitive device artifacts
 /out/
 /stock/
-/validation/
 /symbols/
 /research/
 __pycache__/
@@ -32,3 +31,7 @@ __pycache__/
 /wifi_profiles.toml
 /FIX*-USERDEBUG*.md
 /SOURCE-SHA256SUMS.txt
+/tools/pgz110-repack-only/donor/system/
+/tools/pgz110-repack-only/validation/
+/tools/pgz110-repack-only/VALIDATION-SUMMARY.json
+/tools/pgz110-repack-only/SHA256SUMS

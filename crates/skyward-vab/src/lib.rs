@@ -14,6 +14,8 @@ pub use partitions::{
     slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, Mounted, Mounts, SlotMaps,
     Whole,
 };
+#[cfg(target_os = "android")]
+pub use partitions::{audit_linear_super_holders, release_linear_handoff};
 pub use snapshots::Merge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

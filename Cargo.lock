@@ -1534,6 +1534,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-rust2"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d673a11333485e7d8b93d62a9a5b07b22daf5e8a8655a44c1bb18aa4bf3d1524"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2498,11 +2504,15 @@ version = "0.3.1"
 dependencies = [
  "abootimg-oxide",
  "anyhow",
+ "bzip2",
  "cms",
  "cpio",
+ "crc",
  "flate2",
  "libc",
+ "lz4-sys",
  "lz4_flex 0.14.0",
+ "lzma-rust2",
  "p256",
  "polyfuse-kernel",
  "rsa",
@@ -2512,6 +2522,7 @@ dependencies = [
  "skyward-bootimg",
  "skyward-config",
  "skyward-info",
+ "skyward-lp",
  "skyward-sys",
  "skyward-systems",
  "skyward-vab",

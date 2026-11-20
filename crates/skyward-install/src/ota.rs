@@ -44,6 +44,8 @@ pub enum Log {
     /// Super has no room for snapshots, so it writes over the partitions
     /// of the slot the phone runs from.
     Overwriting,
+    /// Actual payload operations completed by the engine, not ZIP offsets.
+    Operations { done: u64, total: u64 },
     /// It started reading back the `index`th partition it wrote, from 0.
     Hashing { index: usize, partition: String },
 }
@@ -55,6 +57,16 @@ pub fn log(line: &str) -> Option<Log> {
     }
     if line.contains("Will overwrite existing partitions.") {
         return Some(Log::Overwriting);
+    }
+    if let Some(rest) = after(line, "] Completed ") {
+        // The first progress line can say `0/? operations`. Wait for a
+        // real total and never infer write progress from downloaded bytes.
+        if let Some((counts, _)) = rest.split_once(" operations") {
+            let (done, total) = counts.split_once('/')?;
+            let (done, total): (u64, u64) = (done.parse().ok()?, total.parse().ok()?);
+            if total != 0 && done <= total { return Some(Log::Operations { done, total }); }
+            return None;
+        }
     }
     let rest = after(line, "Hashing partition ")?;
     let (index, rest) = rest.split_once(" (")?;
@@ -158,7 +170,12 @@ mod tests {
             Some(Log::Overwriting)
         );
         assert_eq!(log("[INFO:delta_performer.cc(267)] PartitionInfo old odm sha256: 00 size: 4"), None);
-        assert_eq!(log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%)"), None);
+        assert_eq!(log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%)"), Some(Log::Operations { done: 10, total: 400 }));
+        assert_eq!(log("[INFO:delta_performer.cc(127)] Completed 0/? operations, 16384/7084991019 bytes downloaded (0%), overall progress 0%"), None);
+        assert_eq!(log("[INFO:delta_performer.cc(127)] Completed 0/4622 operations, 7084991019/7084991019 bytes downloaded (100%), overall progress 50%"), Some(Log::Operations { done: 0, total: 4622 }));
+        for line in ["[INFO:x] Completed 2/1 operations", "[INFO:x] Completed 0/0 operations", "[INFO:x] Completed -1/3 operations"] {
+            assert_eq!(log(line), None);
+        }
     }
 
     #[test]

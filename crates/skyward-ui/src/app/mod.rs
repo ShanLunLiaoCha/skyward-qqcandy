@@ -46,6 +46,7 @@ mod keys;
 mod manager;
 mod mount;
 mod nav;
+mod ota;
 mod power;
 mod prefs;
 mod reboot;
@@ -69,6 +70,7 @@ pub use frame::*;
 pub use install::*;
 pub use manager::*;
 pub use mount::*;
+pub use ota::*;
 pub use prefs::*;
 pub use reboot::*;
 pub use relabel::*;
@@ -91,6 +93,10 @@ pub enum Screen {
     /// Mounting and unmounting the slot's partitions.
     Mount,
     Install,
+    OtaModels,
+    OtaGenerations(usize),
+    OtaVersions(usize, usize),
+    OtaDownload,
     /// A place's folders and the files in them that can be installed, to
     /// choose one.
     Choose(Place),
@@ -251,6 +257,10 @@ pub enum Action {
     Pattern,
     /// Start receiving a package over USB.
     Sideload,
+    SelectOta(usize),
+    CancelOta,
+    RetryOta,
+    InstallOta,
     /// Send the image to one of the partitions it fits.
     FlashPartition(usize),
     /// Send the image to these slots.
@@ -437,6 +447,8 @@ pub enum Effect {
     /// Start installing the file at this full path, opened in the file
     /// manager, telling how it goes as [`Effect::Sideload`] does.
     InstallPath(String),
+    DownloadOta { model: usize, generation: usize, package: usize },
+    CancelOtaDownload,
     /// Write the image the installer holds to `partition` in the slots
     /// `pick` means.
     Flash { partition: &'static str, pick: Pick },

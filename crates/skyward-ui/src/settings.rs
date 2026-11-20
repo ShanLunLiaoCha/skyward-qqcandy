@@ -64,6 +64,8 @@ pub struct Install {
     /// Skyward goes back into the recovery partitions an install writes
     /// over.
     pub keep_recovery: bool,
+    /// Whether the independent AVB preflight is requested on a supported install path.
+    pub disable_avb: bool,
 }
 
 /// What a backup takes and where it goes.
@@ -126,7 +128,11 @@ impl Settings {
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
-            install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
+            install: Install {
+                check_signature: state.check_signature,
+                keep_recovery: state.keep_recovery,
+                disable_avb: state.disable_avb,
+            },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
                 to: match state.backup_to {
@@ -186,6 +192,7 @@ impl Settings {
         state.file_transfer = self.file_transfer;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
+        state.disable_avb = self.install.disable_avb;
         state.backup = picked(&self.backup.parts, &PARTS);
         match self.backup.to.as_str() {
             STORAGE => state.backup_to = Place::Storage,
@@ -310,6 +317,7 @@ mod tests {
             file_transfer: false,
             check_signature: true,
             keep_recovery: false,
+            disable_avb: false,
             backup: [false, true, true, false],
             backup_to: Place::UsbDrive,
             compress: true,
@@ -323,6 +331,16 @@ mod tests {
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
+    }
+
+    #[test]
+    fn older_install_settings_default_to_requesting_avb_disable() {
+        let kept = Settings::read(r#"{"install":{"check_signature":true,"keep_recovery":false}}"#).unwrap();
+        let mut state = State::default();
+        kept.apply(&mut state);
+        assert!(state.disable_avb);
+        assert!(state.check_signature);
+        assert!(!state.keep_recovery);
     }
 
     #[test]

@@ -57,7 +57,8 @@ impl App {
             return;
         }
         self.state.wlan = Some(w);
-        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
+        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate
+            | Screen::OtaModels | Screen::OtaGenerations(_) | Screen::OtaVersions(..) | Screen::OtaDownload) {
             self.refresh();
         }
         // The status bar shows the network joined over every page.

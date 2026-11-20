@@ -51,9 +51,13 @@ pub struct State {
     /// The phone keeps its recovery in a partition of each slot, which the
     /// install page then offers to keep Skyward in.
     pub recovery_partitions: bool,
+    /// This PGZ110 layout offers a guarded vendor_boot retention preflight.
+    pub vendor_boot_retention: bool,
     /// Skyward goes back into the recovery partitions an install writes
     /// over.
     pub keep_recovery: bool,
+    /// Request AVB disabling independently of Skyward retention and ZIP verification.
+    pub disable_avb: bool,
     /// How Skyward went back into the recovery partitions the install
     /// wrote over, where it did.
     pub reflash: Option<Reflash>,
@@ -178,6 +182,7 @@ pub struct State {
     /// Downloading the newest system's full package, or how that last
     /// ended.
     pub download: Option<DownloadJob>,
+    pub ota_download: Option<OtaDownload>,
     pub skyward_check: SkywardCheck,
     /// Updating Skyward, or how that last ended.
     pub skyward_job: Option<SkywardJob>,
@@ -211,7 +216,9 @@ impl Default for State {
             script_output: Vec::new(),
             check_signature: false,
             recovery_partitions: false,
+            vendor_boot_retention: false,
             keep_recovery: true,
+            disable_avb: true,
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
@@ -266,6 +273,7 @@ impl Default for State {
             check: Check::Idle,
             have: Have::Nothing,
             download: None,
+            ota_download: None,
             skyward_check: SkywardCheck::Idle,
             skyward_job: None,
             traffic: Traffic::default(),
@@ -274,6 +282,20 @@ impl Default for State {
 }
 
 impl State {
+    /// Show the effective AVB setting, including mandatory retention policy.
+    pub fn offers_disable_avb(&self) -> bool {
+        self.vendor_boot_retention
+    }
+
+    /// Whether to pass the active preference to the install preflight.
+    pub fn install_disable_avb(&self) -> bool {
+        self.offers_disable_avb() && (self.keep_recovery || self.disable_avb)
+    }
+
+    pub fn avb_forced_by_retention(&self) -> bool {
+        self.vendor_boot_retention && self.keep_recovery
+    }
+
     /// The key of the on-screen keyboard a finger holds down.
     pub fn key_held(&self) -> Option<Cap> {
         match self.held {

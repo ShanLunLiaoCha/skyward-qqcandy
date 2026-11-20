@@ -4,52 +4,70 @@
 
 English | [简体中文](README.zh-CN.md)
 
-An **unofficial, experimental device port** of [Skyward](https://github.com/kirklin/skyward), a recovery written in Rust. This repository is named **skyward-qqcandy** and contains the modified source, device configuration and image-building tools for the OnePlus Ace Racing Edition. It is not an official OnePlus or upstream Skyward release.
+An **unofficial device port** of [Skyward](https://github.com/kirklin/skyward), a recovery written in Rust. This repository (`skyward-qqcandy`) holds the modified source, PGZ110 configurations, image-building tools and the Android porting helper for the OnePlus Ace Racing Edition. It is not an official OnePlus or upstream Skyward release.
 
-## Device and status
+## Device
 
 | Item | Value |
 | --- | --- |
 | Device | OnePlus Ace Racing Edition / 一加 Ace 竞速版 |
 | Model | PGZ110 |
-| Device codename | `qqcandy` (provided by the port maintainer) |
-| Internal configuration identifier | `OP5911` — retained for existing runtime/tool safety checks |
+| Device codename | `qqcandy` (public name used by this port) |
+| Internal configuration identifier | `OP5911` — kept for existing runtime and tooling safety checks |
 | SoC | MediaTek Dimensity 8100-MAX |
-| Firmware baseline | ColorOS 15 / Android 15 — `PGZ110_15.0.0.1600(CN01)` |
-| Stock kernel baseline | Official stock kernel `5.10.236` |
-| Recovery image partition | `vendor_boot` (A/B); **not a standalone `recovery` partition** |
+| Recovery location | A/B `vendor_boot`, **not a standalone `recovery` partition** |
 | Upstream source baseline | [`c5e09f6`](https://github.com/kirklin/skyward/commit/c5e09f6eb644e75e051b309f98d6745ccbc97d81) |
 
-The port includes changes for MediaTek/Trustonic decryption services, display resume and backlight, touch/keys, LED-class haptics, Wi-Fi calibration/bootstrap, USB/MTP, startup and partition/wipe policies. These are source-level adaptations, **not a claim that every feature works on the phone**.
+Known firmware baselines:
 
-Existing handover notes report successful compilation and host tests, and earlier device observations of data decryption and manual Wi-Fi connectivity. The raw logs are deliberately not part of this public tree; these reports have not been independently reproduced during repository cleanup. OTA installation, APEX RAM backing, reuse of existing device-mapper mappings, dual boot, and general ROM compatibility are **not established** for this device. Other device files are inherited upstream references, not additional support claims by this port.
+| Firmware | Android | Stock kernel |
+| --- | --- | --- |
+| ColorOS 12.1 A.16 | 12 | `5.10.66` |
+| ColorOS 13.1 | 13 | not recorded in this repository |
+| ColorOS 15 `PGZ110_15.0.0.1600(CN01)` | 15 | `5.10.236` |
+
+## What this port adds
+
+- **Official full-package install.** The recovery can install a full official PGZ110 OTA package: it verifies the package's official signature, plans the single-A payload and `super`, and stages every physical partition before writing.
+- **Network install.** The Install page browses a built-in catalogue by model and ColorOS generation and downloads the official full OTA over HTTPS from the phone itself, with resume and length checking; the downloaded package installs from internal storage.
+- **Automatic Skyward porting.** While a full official package is installed, the target's own stock `vendor_boot` is taken from the package and repacked with the running Skyward program, so Skyward ends up inside the system version being installed instead of being lost. The DTB, bootconfig, original modules and firmware are kept from the target image.
+- **Automatic AVB-off.** That same path writes the hashtree/verification disable flags into the current slot's top-level `vbmeta`, and the install page exposes a **Disable AVB** switch; retaining Skyward locks it on. Ordinary OTAs ignore it.
+- **Android porter (`Skyward-Porter`).** `tools/mobile-porter` builds an on-device helper that repacks the phone's own `vendor_boot` with a donor Skyward program, after saving full-partition backups of `vendor_boot` and top-level `vbmeta`, and writes back only after explicit confirmation.
+
+Everything above is PGZ110-specific, needs an unlocked bootloader, and fails closed when the audited layout, capacities or AVB descriptors do not match.
+
+## Status and limits
+
+Compilation and host tests were reported during development, and earlier work recorded on-device data decryption and manual Wi-Fi connectivity. This repository does not contain those raw logs, and the current tree has **not** been rebuilt or re-verified on a phone by whoever maintained this documentation.
+
+Not established for this device: OTA-upgrade compatibility across arbitrary firmware, dual boot, full feature coverage, and whether every bundled tool behaves identically on A.16, 13.1 and 1600. The porter tool has not been installed, granted root or used to flash a phone.
 
 ## Safety
 
-- Unlocking, flashing, decryption and formatting can cause permanent data loss or an unbootable device. Keep independent backups and the matching stock firmware/recovery path.
-- Do not use upstream Xiaomi `fastboot flash recovery` instructions on this phone. No generic flashing command is supplied here: verify the firmware, partition layout, slot and recovery method first.
-- Stock init, filesystem checks and Trustonic services may write to persistent storage. Recovery and diagnostic modes are **not read-only**.
-- In the current source, “All data” closes data, then formats metadata and data, while preserving the PGZ110 shared OEM cache/RBR partition (`oplusreserve2`). Formatting metadata destroys encryption keys and cannot be undone. This source change is not a claim about the previously published image.
-- Debug image tools enable root/debug services and use an explicitly supplied ADB public key. Do not ship a personal key, raw device logs, Wi-Fi credentials or a debug image as a secure production build.
-- Xiaomi-specific online update behavior inherited from upstream is not a supported update channel for this OnePlus port.
+- Unlocking, flashing, repacking `vendor_boot` and disabling AVB can permanently brick the phone or lose data. Keep full-partition backups and a working rescue path before starting.
+- Do not reuse `fastboot flash recovery` instructions from Xiaomi models. Recovery lives in `vendor_boot`; confirm the firmware, slot and partition layout first. No universal flashing command is provided here.
+- Writing the top-level `vbmeta` invalidates the original signature; an unlocked bootloader does not guarantee the bootloader accepts the result.
+- `vendor_boot` and `vbmeta` are written one after the other, not atomically; a failure or power loss can leave a partial write. Do not simply reboot after such an error.
+- Stock init, filesystem checks and Trustonic services may write to persistent storage. Recovery and diagnostic modes are **not** read-only.
+- "All data" closes data, then formats metadata and data, and leaves the PGZ110 shared OEM cache/RBR partition (`oplusreserve2`) alone. Formatting metadata destroys encryption keys and cannot be undone.
+- `userdebug` images and the debug tooling can enable root/debug ADB or carry a preauthorized ADB public key. Do not treat them as production builds, and do not publish a personal key or raw device logs.
 
 ## Repository layout
 
 ```text
-crates/          Skyward workspace and device-port changes; source tests retained
- devices/        Upstream device definitions and OP5911 configurations
- tools/          PGZ110 vendor_boot packaging and supporting scripts
- resources/      Font resources and their individual license notices
- assets/, slides/  Upstream artwork and feature illustrations
+crates/              Skyward workspace, device-port changes and source tests
+ devices/            Upstream definitions plus OP5911 configurations
+ tools/              PGZ110 packing, OTA extraction and userdebug tools
+ tools/mobile-porter/ On-device porter: Java app, native helper and APK build scripts
+ resources/          Font resources and their individual license notices
+ assets/, slides/    Upstream artwork and feature illustrations
 ```
 
-Use [`devices/OP5911.toml`](devices/OP5911.toml) for the main configuration. [`devices/OP5911-decrypt.experimental.toml`](devices/OP5911-decrypt.experimental.toml) and [`devices/OP5911-boot.toml`](devices/OP5911-boot.toml) are alternative experimental configurations, not interchangeable stable profiles. `qqcandy` is the public device/repository name; do not globally rename `OP5911`, which existing safety checks rely on.
+Main configuration: [`devices/OP5911.toml`](devices/OP5911.toml). `devices/OP5911-decrypt.experimental.toml` and `devices/OP5911-boot.toml` are alternative experimental profiles, not interchangeable stable ones. Do not globally rename `OP5911`; existing checks depend on it.
 
 ## Building from source
 
-Use Linux or WSL2 with the checkout and NDK on the Linux filesystem. Requirements: the Rust version in [`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.100.0`), `aarch64-linux-android`, Android NDK r29, and Python 3. Image packaging also requires `lz4`, AOSP `avbtool`, a matching stock `vendor_boot.img`, and the bundled font resources under their individual licenses. This is **not an offline, dependency-free build bundle**.
-
-From the repository root:
+Use Linux or WSL2 with the checkout and NDK on the Linux filesystem: the Rust version in [`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.100.0`), `aarch64-linux-android`, Android NDK r29, Python 3. Packaging also needs `lz4`, AOSP `avbtool`, a matching stock `vendor_boot.img` and the bundled fonts. This is not an offline, dependency-free build bundle.
 
 ```sh
 export ANDROID_NDK_HOME=/path/to/android-ndk-r29
@@ -57,23 +75,19 @@ export SKYWARD_SOURCE="$PWD"
 sh tools/build_android.sh
 ```
 
-The helper builds `skyward` for Android API 30 and runs selected host-side library tests. It does not flash a phone. Dependencies must be obtainable using [`Cargo.lock`](Cargo.lock). A build log or host test pass does not establish on-device safety. To run only those selected tests:
+The helper builds `skyward` for Android API 30 and runs selected host library tests; it does not flash anything. Host tests alone:
 
 ```sh
 cargo test --locked -p skyward-config -p skyward-crypto -p skyward-install -p skyward-systems --lib
 ```
 
-Do not blindly run device tests: some tests format filesystems, mount partitions or manipulate encryption keys.
+Do not run device tests blindly: some of them format filesystems, mount partitions or move encryption keys.
 
-### Packaging vendor_boot
-
-[`tools/vendor_boot.py`](tools/vendor_boot.py) rebuilds the matching stock image while checking its structure and preserving the DTB, ramdisk layout and stock components. It rejects unknown init templates; do not remove those checks to force support for another firmware.
+### Packaging `vendor_boot`
 
 ```sh
 python3 tools/vendor_boot.py build --help
-python3 tools/vendor_boot.py inspect --stock /path/to/matching/vendor_boot.img
 
-mkdir -p out
 python3 tools/vendor_boot.py build \
   --stock /path/to/matching/vendor_boot.img \
   --binary target/aarch64-linux-android/release/skyward \
@@ -87,18 +101,20 @@ python3 tools/vendor_boot.py build \
   --out out/skyward-qqcandy-vendor_boot.img
 ```
 
-This is a packaging example, **not a flashing guide or a tested-release guarantee**. `--allow-unified-platform-fragment` is specific to the audited layout; use it only for a matching image. If the stock image lacks an AVB footer, the tool also requires the verified partition size. Output uses an unsigned AVB hash footer (`algorithm NONE`), not an OEM signature. The script never flashes a device.
+Packaging example only, not a flashing guide or a release guarantee. `--allow-unified-platform-fragment` applies only to the audited layout. Output carries an unsigned AVB hash footer (`algorithm NONE`), not an OEM signature.
 
-Optional userdebug, OTA extraction and Wi-Fi helper scripts remain available for development. Inspect each script and its `--help` before use. GitHub Actions is manual and checks/builds source only; it does not download stock firmware, package images or publish releases.
+### Building the Android porter
+
+[`tools/mobile-porter/README.zh-CN.md`](tools/mobile-porter/README.zh-CN.md) describes the APK build (`tools/mobile-porter/build_apk.ps1` and `build_native.sh`) and the donor extraction step. The APK is development tooling, not a store-ready app.
 
 ## Upstream, modifications and licensing
 
-Skyward is by [kirklin and upstream contributors](https://github.com/kirklin/skyward/graphs/contributors). Original names, copyright notices and the unmodified [`LICENSE`](LICENSE) are retained. The workspace declares **GPL-3.0-or-later**; the device adaptation is distributed under the same license. No upstream endorsement is implied.
+Skyward is by [kirklin and upstream contributors](https://github.com/kirklin/skyward/graphs/contributors). Original names, copyright notices, Git history and the unmodified [`LICENSE`](LICENSE) are retained. The workspace declares **GPL-3.0-or-later** and this port is distributed under it, without implying upstream endorsement.
 
-See [`NOTICE.md`](NOTICE.md) for the dated modification notice and third-party distribution requirements. Third-party libraries and fonts keep their own licenses. The interface uses Xiaomi MiSans, retained unchanged as a Skyward resource and not offered as a standalone font distribution. Its separate [license agreement](resources/fonts/MiSans-LICENSE.txt), reproduced from [Xiaomi](https://hyperos.mi.com/font/download), is not the GPL and must be respected. Kirk Mono and its OFL notice remain together.
+See [`NOTICE.md`](NOTICE.md) for dated modification notices and distribution requirements. Third-party libraries and fonts keep their own licenses. The interface uses Xiaomi MiSans, kept unchanged as a Skyward resource under its [separate agreement](resources/fonts/MiSans-LICENSE.txt); Kirk Mono keeps its OFL notice. The porter APK bundles a GPL Skyward binary, MiSans and the Kirk Mono font, with license texts inside the APK assets.
 
-Before distributing compiled binaries or images, supply the complete corresponding source and required third-party notices/licenses for that exact build, including relevant build scripts and dependencies under their applicable licenses. A lockfile or a reference to a previously delivered private archive is not a substitute. Stock firmware, proprietary runtime files and a third-party redistribution grant are not supplied here.
+Before distributing compiled binaries or images, supply the complete corresponding source for that exact build, the build scripts and all required third-party notices. A lockfile is not a substitute. Stock firmware, proprietary runtime files and a redistribution grant for them are not supplied here.
 
-## Reporting issues
+## Issues
 
-Include the model, firmware build, source revision, selected configuration and a minimal reproduction. Redact serial numbers, keys, Wi-Fi information and personal data from logs. Do not test destructive operations merely to prepare an issue report.
+Include the model, firmware build, source revision, configuration and a minimal reproduction. Redact serial numbers, keys, Wi-Fi details and personal data. Do not perform destructive operations just to file a report.

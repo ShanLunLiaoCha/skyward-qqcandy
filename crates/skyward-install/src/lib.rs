@@ -7,14 +7,49 @@ pub mod adb;
 pub mod asked;
 pub mod blockmap;
 pub mod commands;
+pub mod factory_bundle;
+#[cfg(any(target_os = "android", test))]
+mod factory_backend;
+#[cfg(all(test, target_os = "linux"))]
+mod factory_simulation;
+#[cfg(any(target_os = "android", test))]
+mod factory_source;
+pub mod factory_execute;
+pub mod factory_preflight;
+pub mod factory_preloader;
+#[cfg(any(target_os = "android", test))]
+mod factory_snapshot;
+#[cfg(any(target_os = "android", test))]
+mod factory_targets;
+#[cfg(target_os = "android")]
+pub use factory_targets::with_exclusive_super_for_audit;
 pub mod fuse;
 pub mod image;
 pub mod keep;
+#[cfg(target_os = "android")]
+pub mod lp_capacity;
+#[cfg(any(target_os = "android", test))]
+mod lp_orphan_archive;
+#[cfg(any(target_os = "android", test))]
+mod lp_orphan_evidence;
+#[cfg(any(target_os = "android", test))]
+mod lp_orphan_policy;
+#[cfg(any(target_os = "android", test))]
+pub mod lp_ota_source;
 pub mod ota;
 pub mod package;
+pub mod payload_plan;
+pub mod payload_preflight;
+pub mod payload_stage;
+pub mod retention;
+pub mod progress;
 pub mod script;
 pub mod signature;
+pub mod super_image;
+pub mod super_plan;
+pub mod super_replacement;
 pub mod upgrade;
+pub mod vendor_boot;
 pub mod wipe;
 
 #[cfg(target_os = "android")]
@@ -24,7 +59,7 @@ mod run;
 
 pub use image::{ImageKind, Ramdisk};
 #[cfg(target_os = "android")]
-pub use run::{Detach, Installer};
+pub use run::{ConfirmedLpOta, Detach, Installer, LocalFactoryRestore, OtaRuntime};
 use skyward_info::{Battery, Charge};
 use skyward_vab::{Slot, SnapshotState};
 
@@ -68,10 +103,14 @@ pub struct Options {
     /// A zip with an install script runs only if it was signed with one of
     /// the keys the phone's updates are signed with.
     pub signed: bool,
+    /// Request a verified target with AVB disabled on the PGZ110 stock OTA path.
+    pub disable_avb: bool,
+    /// PGZ110 scopes special payload options to OTA ZIPs signed by a trusted key.
+    pub pgz110_payload_policy: bool,
 }
 
 /// What the installer tells the screen, in the order it happens.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// USB is ready for `adb sideload`.
     Waiting,
@@ -84,6 +123,9 @@ pub enum Event {
     /// system starts. One that erases always waits, and so does one from a
     /// file on the phone, which a single tap picks.
     Ready { version: Option<String>, wipe: bool },
+    /// Signed local PGZ110 restore requires explicit confirmation that A's
+    /// logical data and the physical firmware of both slots will be replaced.
+    FactoryReady { version: Option<String> },
     /// An update package passed the checks and is being installed; the
     /// version it brings.
     Installing { version: Option<String> },
@@ -133,9 +175,31 @@ pub enum Reflash {
     Failed(String),
 }
 
+/// Steps of a local single-A restore, for the install page to word itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactoryStep {
+    ReadingPackage,
+    RepackingVendorBoot,
+    CoreImages,
+    /// Logical volumes placed into the new super: how many, of all.
+    LogicalVolume { index: usize, count: usize, name: String },
+    /// The finished super is read back for its digest: percent, of all.
+    HashingSuper { percent: u32 },
+    Physical { index: usize, count: usize, name: String },
+    Publishing,
+    /// An exclusive claim on one boot target: how many, of all.
+    Claiming { index: usize, count: usize, name: String },
+    Writing { index: usize, count: usize, name: String },
+    Syncing { name: String },
+    Activating,
+}
+
 /// How far the work is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
+    /// A restore this build performs itself, as a step the screen can word
+    /// in the language it is set to.
+    Factory(FactoryStep),
     /// update_engine writes the new system: the bytes of its payload read
     /// so far.
     Writing { done: u64, total: u64 },

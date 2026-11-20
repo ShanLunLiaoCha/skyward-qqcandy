@@ -26,6 +26,7 @@ pub enum Switch {
     /// Write Skyward back into the recovery partitions an install writes
     /// over.
     KeepRecovery,
+    DisableAvb,
     Wlan,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,

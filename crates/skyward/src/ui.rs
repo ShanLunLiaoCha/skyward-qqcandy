@@ -21,7 +21,7 @@ use skyward_block::{fstab, mount, probe};
 use skyward_config::{DeviceConfig, Service};
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
-use skyward_install::{Detach, Installer, Options};
+use skyward_install::{Detach, Installer, Options, OtaRuntime};
 use skyward_sys::bcb::{self, Work, REFORMATS};
 use skyward_sys::control::{Control, Request};
 use skyward_sys::Power;
@@ -38,7 +38,7 @@ use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
-    INSTALL_UNFINISHED, USB_DRIVE,
+    INSTALL_UNFINISHED, OTA_DIRECTORY, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
@@ -635,7 +635,7 @@ fn install_asked(programs: &[Service], app: &App, pending: Pending) -> Result<In
             mount::mount_ro(Path::new(&fstab::device(&cache)?), at)?;
         }
     }
-    Installer::asked(pending.package, pending.retry, detach(programs.to_vec()), install_options(app))
+    Installer::asked(pending.package, pending.retry, detach(programs.to_vec()), install_options(app), ota_runtime(app))
 }
 
 /// Where a reboot rescue asked for goes: the target, and whether it is
@@ -926,7 +926,13 @@ fn detach(services: Vec<Service>) -> Detach {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    Options { keep: app.state.keep_recovery && (app.state.recovery_partitions || app.state.vendor_boot_retention),
+        signed: app.state.check_signature, disable_avb: app.state.install_disable_avb(),
+        pgz110_payload_policy: app.state.vendor_boot_retention }
+}
+
+fn ota_runtime(app: &App) -> Option<OtaRuntime> {
+    app.state.vendor_boot_retention.then_some(crate::boot_services::with_stock_ota_boot_control)
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1004,15 +1010,55 @@ fn job_end(end: filework::End) -> JobEnd {
 /// are the phone's own that the recovery keeps running: the
 /// configuration's, and those the phone's partitions name for its keys.
 pub fn run(cfg: &DeviceConfig, programs: &[Service], runtime: crate::runtime::Runtime, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+    run_local(cfg, programs, runtime, font, mono, request, start, dump, None)
+}
+
+pub(crate) fn run_local(cfg: &DeviceConfig, programs: &[Service], runtime: crate::runtime::Runtime,
+    font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>,
+    resume: Option<crate::lp_ota_ticket::Ticket>) -> Result<()> {
     let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
     pages.secure_runtime = runtime;
-    pages.begin()?;
+    if let Some(ticket) = resume {
+        ensure!(matches!(pages.request.work, Work::Menu), "resumed OTA must remain a local UI install");
+        pages.app.show_resumed_local_ota(ticket.stamp.size);
+        pages.secure_quiesced = true;
+        pages.installer = Some(Installer::resume_confirmed_lp_ota(ticket.file, ticket.stamp, ticket.digest,
+            detach(pages.programs.to_vec()), install_options(&pages.app), ota_runtime(&pages.app))?);
+    } else {
+        pages.begin()?;
+    }
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
     // A uevent may be a charger or a computer attached or taken away: the
     // battery is read at once, and the phone stays awake until it is.
     let uevents = uevent::Listener::open()?;
     loop {
+        #[cfg(target_os = "android")]
+        if crate::lp_handoff::applies(cfg) && start == Screen::Home
+            && pages.ready_for_lp_handoff()
+            && (pages.lp_ota.is_some() || crate::lp_handoff::requested()?)
+            && skyward_block::mount::visible(Path::new("/data"))?.is_some()
+            && pages.quiesce_secure_runtime(monotonic_ms())? {
+            // Dropping the MTP FunctionFS descriptors while it is still part
+            // of the gadget can disconnect ADB as well. Switch explicitly
+            // before replacing the UI process, just like a normal MTP stop.
+            if let Some(transfer) = pages.transfer.take() {
+                transfer.stop(true).context("return USB to ADB before LP handoff")?;
+            } else if skyward_sys::prop("sys.usb.state").as_deref() != Some("adb") {
+                skyward_sys::usb::switch("adb", USB_TIMEOUT).context("select ADB before LP handoff")?;
+            }
+            ensure!(skyward_sys::prop("sys.usb.state").as_deref() == Some("adb"), "LP handoff requires confirmed ADB-only USB");
+            skyward_sys::kmsg("LP handoff: ADB-only USB ready; leaving Recovery UI")?;
+            let ota = pages.lp_ota.take();
+            drop(pages);
+            drop(sleeper);
+            drop(uevents);
+            if let Some(confirmed) = ota {
+                let (file, stamp, digest) = confirmed.into_parts();
+                return crate::lp_ota_ticket::exec(crate::lp_ota_ticket::Ticket { file, stamp, digest }, "run-lp-handoff");
+            }
+            return crate::lp_handoff::enter(cfg);
+        }
         pages.turn(&sleeper, &uevents)?;
     }
 }
@@ -1088,6 +1134,7 @@ struct Pages<'a> {
     leave: Target,
     leave_at: Option<u64>,
     installer: Option<Installer>,
+    lp_ota: Option<skyward_install::ConfirmedLpOta>,
     /// The install the system asked for, until the data partition it is in
     /// opens, or the user whose own files hold it unlocks them.
     pending: Option<Pending>,
@@ -1132,6 +1179,7 @@ struct Pages<'a> {
     /// Asking the update server, and downloading the full package.
     checker: Option<updates::Worker>,
     downloader: Option<updates::Worker>,
+    ota_downloader: Option<(updates::Worker, PathBuf)>,
     /// Asking GitHub for Skyward's newest release, and updating to it.
     skyward_checker: Option<updates::Worker>,
     skyward_updater: Option<updates::Worker>,
@@ -1272,6 +1320,11 @@ impl<'a> Pages<'a> {
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
         app.state.recovery_partitions = cfg.device.recovery_partition == skyward_config::RecoveryPartition::Recovery && both("recovery")?;
+        // Show these choices from the Recovery layout alone. Display does
+        // not probe device names, mounted firmware, or partition nodes.
+        app.state.vendor_boot_retention = cfg.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot;
+        // Use the existing enabled default; honour saved user preferences.
+        // The install preflight still stops before any unsupported writes.
         app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
@@ -1333,6 +1386,7 @@ impl<'a> Pages<'a> {
             leave_at: None,
             request,
             installer: None,
+            lp_ota: None,
             pending: None,
             rescue_leaves: None,
             eraser: None,
@@ -1353,6 +1407,7 @@ impl<'a> Pages<'a> {
             scanned_at: Instant::now(),
             checker: None,
             downloader: None,
+            ota_downloader: None,
             skyward_checker: None,
             skyward_updater: None,
             shell: None,
@@ -1382,12 +1437,12 @@ impl<'a> Pages<'a> {
             }
             Work::Sideload { .. } => {
                 self.app.start_sideload();
-                self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app))?);
+                self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app), ota_runtime(&self.app))?);
                 self.sideloading = true;
             }
             Work::Rescue => {
                 self.app.start_rescue();
-                self.installer = Some(Installer::rescue(detach(self.programs.to_vec()), install_options(&self.app))?);
+                self.installer = Some(Installer::rescue(detach(self.programs.to_vec()), install_options(&self.app), ota_runtime(&self.app))?);
                 self.sideloading = true;
             }
             Work::Update(update) => {
@@ -1772,6 +1827,9 @@ impl<'a> Pages<'a> {
         if let Some(d) = &self.downloader {
             fds.push(d.fd());
         }
+        if let Some((worker, _)) = &self.ota_downloader {
+            fds.push(worker.fd());
+        }
         if let Some(c) = &self.skyward_checker {
             fds.push(c.fd());
         }
@@ -1802,6 +1860,7 @@ impl<'a> Pages<'a> {
             || self.part_worker.is_some()
             || self.checker.is_some()
             || self.downloader.is_some()
+            || self.ota_downloader.is_some()
             || self.skyward_checker.is_some()
             || self.skyward_updater.is_some()
             || systems_busy;
@@ -1871,6 +1930,13 @@ impl Pages<'_> {
                 }
                 Told::Reboot(target) => self.rescue_leaves = Some(rescue_target(target)),
                 _ => {}
+            }
+            if finished && let Some(confirmed) = self.installer.as_ref().context("finished installer is absent")?.take_confirmed_lp_ota()? {
+                ensure!(self.lp_ota.is_none() && matches!(self.request.work, Work::Menu), "unexpected LP OTA continuation");
+                self.lp_ota = Some(confirmed);
+                self.installer = None;
+                self.sideloading = false;
+                continue;
             }
             self.app.install(ev, now);
             if finished {
@@ -2257,6 +2323,32 @@ impl Pages<'_> {
         if fetched {
             self.downloader = None;
         }
+        let told = self.ota_downloader.as_ref().map(|(worker, _)| worker.events()).unwrap_or_default();
+        for event in told {
+            match event {
+                updates::Event::Progress(download::Progress::Downloading { done, total }, _) => {
+                    self.app.ota_download_progress(done, Some(total));
+                }
+                updates::Event::Ended(end) => {
+                    let Some((_, path)) = self.ota_downloader.take() else { break; };
+                    match end {
+                        updates::End::Downloaded => match fs::symlink_metadata(&path) {
+                            Ok(meta) if meta.is_file() && meta.len() != 0 => {
+                                self.app.ota_download_progress(meta.len(), Some(meta.len()));
+                                self.app.ota_download_finished(Ok(path.display().to_string()));
+                            }
+                            _ => self.app.ota_download_finished(Err("The downloaded OTA file is no longer available".into())),
+                        },
+                        updates::End::Stopped => self.app.ota_download_cancelled(),
+                        updates::End::Failed(Failure::NoRoom { needed, free }) => self.app.ota_download_finished(Err(format!("Not enough space in /data/ota_package: need {needed} bytes, {free} available"))),
+                        updates::End::Failed(Failure::Other(reason)) => self.app.ota_download_finished(Err(reason)),
+                        _ => self.app.ota_download_finished(Err("Unexpected OTA download result".into())),
+                    }
+                    break;
+                }
+                _ => (),
+            }
+        }
         Ok(())
     }
 
@@ -2458,6 +2550,31 @@ impl Pages<'_> {
         Ok(())
     }
 
+    fn open_local_ota(&self, path: PathBuf) -> Result<Installer> {
+        // Keep installs in the normal Recovery UI. Maintenance is a
+        // separately requested diagnostic, not an install-time transition.
+        // A confirmed PGZ110 partial Virtual A/B package takes the dedicated
+        // single-A restore route instead of the OEM engine.
+        let cfg = self.cfg.clone();
+        let selected = path.clone();
+        let restore: skyward_install::LocalFactoryRestore =
+            Box::new(move |package, options, cancelled, first_write| {
+                crate::factory_restore::run(&cfg, package, &selected, options.disable_avb, cancelled, first_write)
+            });
+        Installer::open_with_factory_restore(path, detach(self.programs.to_vec()), install_options(&self.app), ota_runtime(&self.app), restore)
+    }
+
+    fn ready_for_lp_handoff(&self) -> bool {
+        matches!(self.request.work, Work::Menu) && !self.fastboot && !self.sideloading
+            && !self.switch_asked && !self.switched && self.leave_at.is_none()
+            && self.installer.is_none() && self.pending.is_none() && self.eraser.is_none()
+            && self.decryptor.is_none() && self.part_worker.is_none() && self.worker.is_none()
+            && self.relabeler.is_none() && self.backuper.is_none() && self.merger.is_none()
+            && self.systems_worker.is_none() && self.checker.is_none() && self.downloader.is_none()
+            && self.ota_downloader.is_none()
+            && self.skyward_checker.is_none() && self.skyward_updater.is_none() && self.shell.is_none()
+    }
+
     /// Quiesce only owned security processes before a partition transaction.
     /// Keep an already-open /data mounted: an installer may still need to read
     /// its package from it. The existing wipe/restore worker owns unmounting.
@@ -2501,6 +2618,15 @@ impl Pages<'_> {
     /// Do what a page asks for, and give what the pages ask for in answer
     /// to it.
     fn effect(&mut self, fx: Effect, now: u64) -> Result<Vec<Effect>> {
+        // Do not open a second transaction while a confirmed local OTA owns
+        // the one-shot handoff. The event loop still drains existing work.
+        if self.lp_ota.is_some() { return Ok(Vec::new()); }
+        if self.ota_downloader.is_some() && matches!(&fx,
+            Effect::FactoryReset | Effect::Wipe(_) | Effect::Unmount(_) | Effect::Reboot(_) |
+            Effect::Filesystem { action: FsAction::Remake(_), .. } | Effect::Restore { .. }) {
+            self.app.report("Finish or cancel the OTA download first", now);
+            return Ok(Vec::new());
+        }
         if self.cfg.trustonic.is_some() && matches!(&fx,
             Effect::FactoryReset | Effect::Wipe(_) | Effect::Install |
             Effect::Sideload | Effect::InstallFile(..) | Effect::InstallPath(_) |
@@ -2555,18 +2681,18 @@ impl Pages<'_> {
             }
             Effect::Sideload => {
                 if self.may_install(now)? {
-                    self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app))?);
+                    self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app), ota_runtime(&self.app))?);
                     self.sideloading = true;
                 }
             }
             Effect::InstallFile(place, path) => {
                 if self.may_install(now)? {
-                    self.installer = Some(Installer::open(in_place(place, &path), detach(self.programs.to_vec()), install_options(&self.app))?);
+                    self.installer = Some(self.open_local_ota(in_place(place, &path))?);
                 }
             }
             Effect::InstallPath(path) => {
                 if self.may_install(now)? {
-                    self.installer = Some(Installer::open(PathBuf::from(path), detach(self.programs.to_vec()), install_options(&self.app))?);
+                    self.installer = Some(self.open_local_ota(PathBuf::from(path))?);
                 }
             }
             Effect::Flash { partition, pick } => {
@@ -2661,6 +2787,15 @@ impl Pages<'_> {
             Effect::CheckUpdate => self.check_update()?,
             Effect::Download(release) => self.download(release, now)?,
             Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
+            Effect::DownloadOta { model, generation, package } => {
+                if let Err(e) = self.download_ota(model, generation, package) {
+                    self.app.ota_download_finished(Err(format!("{e:#}")));
+                }
+            }
+            Effect::CancelOtaDownload => {
+                if let Some((worker, _)) = &self.ota_downloader { worker.stop(); }
+                else { self.app.ota_download_cancelled(); }
+            }
             Effect::CheckSkyward => {
                 ensure!(self.skyward_checker.is_none(), "GitHub is being asked already");
                 let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
@@ -3001,8 +3136,45 @@ impl Pages<'_> {
     }
 
     /// Download `release`'s full package into internal storage.
+    fn download_ota(&mut self, model: usize, generation: usize, package: usize) -> Result<()> {
+        ensure!(self.ota_downloader.is_none() && self.downloader.is_none(), "another package is downloading");
+        ensure!(self.eraser.is_none() && self.installer.is_none() && self.part_worker.is_none(),
+            "finish the current partition work before downloading");
+        ensure!(self.app.state.data.storage_open() && mount::is_mount_point(Path::new("/data"))?,
+            "open internal storage before downloading to /data/ota_package");
+        let model = skyward_ui::ota_catalog::GROUPS.get(model).context("unknown OTA model")?;
+        let entry = model.generations.get(generation).and_then(|group| group.packages.get(package))
+            .context("unknown OTA release")?;
+        let name = entry.url.rsplit('/').next().context("missing OTA filename")?;
+        let stem = name.strip_suffix(".zip").context("invalid OTA filename")?;
+        ensure!(!stem.is_empty() && stem.len() <= 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid OTA filename");
+        let directory = Path::new(OTA_DIRECTORY);
+        let path = directory.join(format!("{}-{name}", model.model));
+        match fs::symlink_metadata(directory) {
+            Ok(meta) => ensure!(meta.is_dir(), "OTA download directory is not a plain directory"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).context("inspect OTA download directory"),
+        }
+        // A successful download is saved permanently. Choosing the same
+        // entry again opens the saved file for explicit local confirmation.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() != 0 => {
+                self.app.ota_download_progress(meta.len(), Some(meta.len()));
+                self.app.ota_download_finished(Ok(path.display().to_string()));
+                return Ok(());
+            }
+            Ok(_) => anyhow::bail!("OTA destination already exists and is not a complete local file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).context("inspect existing OTA download"),
+        }
+        let task = updates::Task::DownloadOta { url: entry.url, path: path.clone() };
+        self.ota_downloader = Some((updates::Worker::start(task, self.servers.clone())?, path));
+        Ok(())
+    }
+
     fn download(&mut self, release: Release, now: u64) -> Result<()> {
-        ensure!(self.downloader.is_none(), "the full package is being downloaded already");
+        ensure!(self.downloader.is_none() && self.ota_downloader.is_none(), "a system package is being downloaded already");
         let server = self.cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
         let path = downloaded(&release);
         match installed(self.cfg, &self.info) {

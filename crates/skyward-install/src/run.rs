@@ -8,7 +8,7 @@ use crate::adb::{self, Connection, Offer, Service};
 use crate::asked::Asked;
 use crate::blockmap::BlockMap;
 use crate::ffs::{Endpoints, Shared, Usb};
-use crate::fuse::{self, Fault, LocalFile, Mount};
+use crate::fuse::{self, Fault, LocalFile};
 use crate::image::{self, ImageKind};
 use crate::keep::Kept;
 use crate::ota::{self, Log, Status};
@@ -29,7 +29,22 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// A confirmed OTA handoff can only be produced by the installer worker,
+/// after successful verification and FUSE shutdown.
+#[derive(Debug)]
+pub struct ConfirmedLpOta {
+    file: File,
+    stamp: crate::lp_ota_source::FileStamp,
+    digest: [u8; 32],
+}
+
+impl ConfirmedLpOta {
+    pub fn into_parts(self) -> (File, crate::lp_ota_source::FileStamp, [u8; 32]) {
+        (self.file, self.stamp, self.digest)
+    }
+}
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +52,14 @@ use std::time::{Duration, Instant};
 /// writing. Either may write over the installed system's partitions, so
 /// whatever still runs from them has to move off first.
 pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// Dedicated Recovery restore for a confirmed, authenticated local OTA.
+/// The source is the same read-only FUSE file until the callback returns.
+/// Never use the ordinary update_engine or lazy-detach path in this callback.
+pub type LocalFactoryRestore = Box<dyn FnOnce(&Path, Options, &dyn Fn() -> bool, &dyn Fn()) -> Result<()> + Send>;
+
+/// Device-specific runtime lease, scoped to update_engine (not ZIP scripts).
+pub type OtaRuntime = fn(&mut dyn FnMut() -> Result<i32>) -> Result<i32>;
 
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
@@ -66,20 +89,64 @@ pub struct Installer {
     shared: Arc<Shared>,
     /// The screen lets it go once it has finished.
     worker: Worker<Event>,
+    confirmed_lp_ota: Arc<Mutex<Option<ConfirmedLpOta>>>,
 }
 
 impl Installer {
     /// Take USB over and wait for `adb sideload`, from a thread of its own.
     /// `detach` runs before an update package or an install script writes;
     /// `options` say what else the install does.
-    pub fn start(detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Computer, detach, options, run)
+    pub fn start(detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::Computer, detach, options, ota_runtime, run)
     }
 
     /// Install the file at `path`, from a thread of its own; `detach` and
     /// `options` as for [`Installer::start`].
-    pub fn open(path: PathBuf, detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::File, detach, options, move |ctx| run_file(ctx, &path))
+    pub fn open(path: PathBuf, detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::File, detach, options, ota_runtime, move |ctx| run_file(ctx, &path))
+    }
+
+    /// Opt in only from the interactive local install page. Other origins
+    /// never receive this dedicated restore executor.
+    pub fn open_with_factory_restore(path: PathBuf, detach: Detach, options: Options,
+        ota_runtime: Option<OtaRuntime>, restore: LocalFactoryRestore) -> Result<Installer> {
+        Installer::spawn(Origin::File, detach, options, ota_runtime, move |ctx| {
+            ctx.local_factory_restore = Some(restore);
+            run_file(ctx, &path)
+        })
+    }
+
+    /// Local installation with a UI capable of consuming the one-shot
+    /// maintenance continuation. Never enable this for an unattended origin.
+    pub fn open_with_lp_handoff(path: PathBuf, detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::File, detach, options, ota_runtime, move |ctx| {
+            ctx.allow_lp_handoff = true;
+            run_file(ctx, &path)
+        })
+    }
+
+    /// Resume a previously confirmed local install. The frontend must first
+    /// consume its own same-boot one-shot authority; this verifies the file
+    /// again and only carries forward the already granted confirmation.
+    pub fn resume_confirmed_lp_ota(file: File, stamp: crate::lp_ota_source::FileStamp, digest: [u8; 32],
+        detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::File, detach, options, ota_runtime, move |ctx| {
+            if let Err(error) = (|| -> Result<()> {
+                ensure!(stamp.size == crate::lp_ota_source::CAPTURED_OTA_SIZE
+                    && digest == crate::lp_ota_source::CAPTURED_OTA_SHA256, "unexpected resumed OTA identity");
+                ensure!(crate::lp_ota_source::FileStamp::read(&file)? == stamp, "resumed OTA descriptor changed");
+                let data = skyward_block::mount::visible(Path::new(DATA))?.context("userdata is not mounted")?;
+                let dev = stamp.device as libc::dev_t;
+                ensure!(data.device == (libc::major(dev) as u32, libc::minor(dev) as u32), "resumed OTA left userdata");
+                Ok(())
+            })() { return failed(error); }
+            let (file, offer) = match LocalFile::from_file(file) {
+                Ok(source) => source,
+                Err(error) => return failed(error),
+            };
+            ctx.resumed_lp_digest = Some(digest);
+            serve_local(ctx, file, offer, Path::new("confirmed local OTA"))
+        })
     }
 
     /// Install the package the system asked for, from a thread of its own,
@@ -87,8 +154,8 @@ impl Installer {
     /// with an install script, as Android's own recovery installs one.
     /// `retry` when the install started before and a restart cut it off;
     /// `detach` and `options` as for [`Installer::start`].
-    pub fn asked(package: Asked, retry: bool, detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Asked { retry }, detach, options, move |ctx| match &package {
+    pub fn asked(package: Asked, retry: bool, detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::Asked { retry }, detach, options, ota_runtime, move |ctx| match &package {
             Asked::File(path) => run_file(ctx, path),
             Asked::Mapped(map) => run_mapped(ctx, map),
         })
@@ -99,26 +166,35 @@ impl Installer {
     /// the phone is is answered, and erasing all user data is asked of the
     /// screen with [`Event::Wipe`]. The computer stays on for command after
     /// command, until it asks the phone to leave or the screen cancels.
-    pub fn rescue(detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Computer, detach, options, rescue)
+    pub fn rescue(detach: Detach, options: Options, ota_runtime: Option<OtaRuntime>) -> Result<Installer> {
+        Installer::spawn(Origin::Computer, detach, options, ota_runtime, rescue)
     }
 
     fn spawn(
         origin: Origin,
         detach: Detach,
         options: Options,
+        ota_runtime: Option<OtaRuntime>,
         work: impl FnOnce(&mut Context) -> Outcome + Send + 'static,
     ) -> Result<Installer> {
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let theirs = shared.clone();
+        let confirmed_lp_ota = Arc::new(Mutex::new(None));
+        let handoff = confirmed_lp_ota.clone();
         let worker = Worker::start("installer", move |events| {
-            let mut ctx = Context { events, commands: command_rx, shared: theirs, detach: Some(detach), options, origin };
+            let mut ctx = Context { events, commands: command_rx, shared: theirs, detach: Some(detach), options, ota_runtime,
+                origin, local_lp_file: None, confirmed_lp_ota: handoff, allow_lp_handoff: false, resumed_lp_digest: None, local_factory_restore: None };
             let outcome = work(&mut ctx);
             let _ = kmsg(&format!("install: {outcome:?}"));
             ctx.send(Event::Finished(outcome));
         })?;
-        Ok(Installer { commands, shared, worker })
+        Ok(Installer { commands, shared, worker, confirmed_lp_ota })
+    }
+
+    /// Take the verified package only once after the worker announces finish.
+    pub fn take_confirmed_lp_ota(&self) -> Result<Option<ConfirmedLpOta>> {
+        Ok(self.confirmed_lp_ota.lock().map_err(|_| anyhow!("OTA continuation lock poisoned"))?.take())
     }
 
     /// Readable while events wait.
@@ -186,7 +262,13 @@ struct Context {
     shared: Arc<Shared>,
     detach: Option<Detach>,
     options: Options,
+    ota_runtime: Option<OtaRuntime>,
     origin: Origin,
+    allow_lp_handoff: bool,
+    resumed_lp_digest: Option<[u8; 32]>,
+    local_factory_restore: Option<LocalFactoryRestore>,
+    local_lp_file: Option<(File, crate::lp_ota_source::FileStamp)>,
+    confirmed_lp_ota: Arc<Mutex<Option<ConfirmedLpOta>>>,
 }
 
 impl Context {
@@ -229,6 +311,7 @@ fn run(ctx: &mut Context) -> Outcome {
 /// What installing came to while the package was still served.
 enum Done {
     Decided(Outcome),
+    Handoff(ConfirmedLpOta),
     /// update_engine failed with this code.
     Engine(i32),
     /// The install script ended with this status; `wipe_cache` when it
@@ -261,7 +344,7 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
         }
     };
     let mount = mounted.serve(conn);
-    let done = install(ctx, &mount, offer.size).unwrap_or_else(Done::Error);
+    let done = install(ctx, offer.size).unwrap_or_else(Done::Error);
     let (mut conn, served) = mount.unmount();
     let outcome = conclude(done, served, ctx.origin);
     finish(&mut conn, ending(&outcome));
@@ -275,6 +358,17 @@ fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
         Err(e) => return Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
     };
     let _ = kmsg(&format!("install: {}, {} bytes", path.display(), offer.size));
+    if ctx.allow_lp_handoff && offer.size == crate::lp_ota_source::CAPTURED_OTA_SIZE {
+        let pin = (|| -> Result<_> {
+            let fd = file.pinned_file()?;
+            let stamp = crate::lp_ota_source::FileStamp::read(&fd)?;
+            let data = skyward_block::mount::visible(Path::new(DATA))?.context("userdata is not mounted")?;
+            let dev = stamp.device as libc::dev_t;
+            ensure!(data.device == (libc::major(dev) as u32, libc::minor(dev) as u32), "OTA is not on mounted userdata");
+            Ok((fd, stamp))
+        })();
+        ctx.local_lp_file = pin.ok();
+    }
     serve_local(ctx, file, offer, path)
 }
 
@@ -303,9 +397,18 @@ fn serve_local<S: fuse::Source + Send + 'static>(ctx: &mut Context, source: S, o
         Err(e) => return failed(e),
     };
     let mount = mounted.serve(source);
-    let done = install(ctx, &mount, offer.size).unwrap_or_else(Done::Error);
+    let done = install(ctx, offer.size).unwrap_or_else(Done::Error);
     let (_, served) = mount.unmount();
-    conclude(done, served, ctx.origin)
+    match (done, served) {
+        (Done::Handoff(request), Ok(None)) if !ctx.shared.cancelled() => {
+            match ctx.confirmed_lp_ota.lock() {
+                Ok(mut next) => { *next = Some(request); Outcome::Cancelled }
+                Err(_) => failed(anyhow!("OTA continuation lock poisoned")),
+            }
+        }
+        (Done::Handoff(_), Ok(None)) => Outcome::Cancelled,
+        (done, served) => conclude(done, served, ctx.origin),
+    }
 }
 
 /// Tell the computer the package has been read, so `adb sideload` ends; in
@@ -420,18 +523,51 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
             Origin::File | Origin::Asked { .. } => Failure::Unreadable(why),
         }),
         (_, Ok(Some(Fault::Changed(_)))) => Outcome::Failed(Failure::Changed),
+        (Done::Handoff(_), Ok(None)) => failed(anyhow!("unexpected OTA maintenance handoff origin")),
         (Done::Engine(code), Ok(None)) => Outcome::Failed(Failure::Engine(code)),
         (Done::Script { code, .. }, Ok(None)) => Outcome::Failed(Failure::Script(code)),
         (Done::Error(e), Ok(None)) => failed(e),
     }
 }
 
-fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
-    let file = File::open(fuse::PACKAGE).context("open the package")?;
-    let package = package::identify(BufReader::with_capacity(1 << 16, file))?;
+fn install(ctx: &mut Context, size: u64) -> Result<Done> {
+    let open = || File::open(fuse::PACKAGE).context("open the package");
+    if let Some(expected) = ctx.resumed_lp_digest {
+        match verify_signature(ctx, size)? {
+            Verdict::Signed => (),
+            Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+            Verdict::Unsigned | Verdict::Unverified => return Ok(Done::Decided(Outcome::Refused(Refusal::Unverified))),
+        }
+        let zip = open()?;
+        let stamp = crate::lp_ota_source::FileStamp::read(&zip)?;
+        ensure!(crate::lp_ota_source::digest(&zip, stamp, || ctx.shared.cancelled())? == expected, "resumed OTA differs from the confirmed ZIP");
+        let (_, hash) = crate::payload_preflight::read_zip_with_digest(&mut BufReader::new(zip))?;
+        crate::factory_preflight::reviewed_roster(&hash)?;
+        return match package::identify(BufReader::new(open()?))? {
+            Package::Update(update) if !update.wipes() => update_system(ctx, &update, size, true),
+            _ => bail!("resumed OTA is not the confirmed non-wipe payload"),
+        };
+    }
+    let mixed = ctx.options.pgz110_payload_policy && package::embeds_payload_and_script(BufReader::new(open()?))?;
+    if mixed {
+        match verify_signature(ctx, size)? {
+            Verdict::Signed => (),
+            Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+            Verdict::Unsigned | Verdict::Unverified => {
+                // Don't automatically run an untrusted script requested by
+                // Android itself (that origin has no manual confirmation).
+                if matches!(ctx.origin, Origin::Asked { .. }) {
+                    return Ok(Done::Decided(Outcome::Refused(Refusal::Unverified)));
+                }
+                let _ = kmsg("install: nonofficial mixed ZIP uses its own install script");
+                return run_script(ctx, size);
+            }
+        }
+    }
+    let package = package::identify(BufReader::with_capacity(1 << 16, open()?))?;
     let _ = kmsg(&format!("install: {}", describe(&package)));
     match package {
-        Package::Update(update) => update_system(ctx, mount, &update),
+        Package::Update(update) => update_system(ctx, &update, size, mixed),
         // The system asks for packages that install themselves, as Android's
         // own recovery takes nothing else; an image needs someone to say
         // where it goes.
@@ -555,14 +691,21 @@ fn describe(package: &Package) -> String {
     }
 }
 
-fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Result<Done> {
+fn update_system(ctx: &mut Context, update: &Update, size: u64, verified: bool) -> Result<Done> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-    if let Err(refusal) = package::check(update, &phone(slot)?) {
+    let config = skyward_config::DeviceConfig::load(Path::new("/").join(skyward_config::ramdisk::CONFIG))?;
+    if let Err(refusal) = package::check_for_recovery(update, &phone(slot)?, &config) {
         return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
     if let Some(refusal) = short_of_charge(ctx.origin)? {
         return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
+    // On PGZ110, partial VAB payloads must use the dedicated recovery
+    // route, not the OEM sideload fallback which can alias current A data.
+    let factory = factory_route(crate::payload_preflight::pgz_partial_vab(&config, update,
+        || Ok(BufReader::new(File::open(fuse::PACKAGE)?)))?,
+        ctx.origin, update.wipes(), ctx.resumed_lp_digest.is_some(),
+        ctx.local_factory_restore.is_some())?;
     let state = skyward_vab::snapshot_state()?;
     if state != SnapshotState::None {
         return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
@@ -573,18 +716,77 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     }
     let version = update.version().map(str::to_string);
     let wipe = update.wipes();
-    if waits(ctx.origin, wipe) {
-        ctx.send(Event::Ready { version: version.clone(), wipe });
+    if waits(ctx.origin, wipe) && ctx.resumed_lp_digest.is_none() {
+        if factory {
+            ctx.send(Event::FactoryReady { version: version.clone() });
+        } else {
+            ctx.send(Event::Ready { version: version.clone(), wipe });
+        }
         match ctx.commands.recv() {
             Ok(Command::Install) => {}
             Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
             Ok(other) => bail!("an update waiting to be agreed to was told {other:?}"),
         }
     }
+    crate::lp_orphan_archive::check_idle(Path::new(METADATA))?;
+    if factory {
+        if ctx.shared.cancelled() { return Ok(Done::Decided(Outcome::Cancelled)); }
+        let restore = ctx.local_factory_restore.take().context("no dedicated restore executor")?;
+        ctx.send(Event::Installing { version });
+        let teller = ctx.events.clone();
+        crate::progress::with_sink(move |step| { teller.tell(Event::Progress(Stage::Factory(step))); }, || {
+            restore(Path::new(fuse::PACKAGE), ctx.options, &|| ctx.shared.cancelled(),
+                &|| ctx.send(Event::Overwriting))
+        })?;
+        return Ok(Done::Decided(Outcome::Installed { slot: Slot::A, wipe: false }));
+    }
+    let repair_capacity = crate::lp_capacity::needs_repair(slot)?;
+    ensure!(!repair_capacity || ctx.resumed_lp_digest.is_none(), "LP maintenance did not correct capacity; refusing resumed OTA");
+    if repair_capacity {
+        if let Err(error) = crate::lp_capacity::preflight() {
+            if let Some((file, stamp)) = ctx.local_lp_file.take().filter(|_| {
+                !wipe && ctx.origin == Origin::File && config.device.codename == "OP5911"
+                    && config.device.recovery_partition == skyward_config::RecoveryPartition::VendorBoot
+            }) {
+                if !verified {
+                    match verify_signature(ctx, size)? {
+                        Verdict::Signed => (),
+                        Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+                        Verdict::Unsigned | Verdict::Unverified => return Ok(Done::Decided(Outcome::Refused(Refusal::Unverified))),
+                    }
+                }
+                // Digest through FUSE so the source agrees with every block
+                // already read by the whole-ZIP verifier.
+                let zip = File::open(fuse::PACKAGE)?;
+                crate::lp_capacity::is_captured_handoff_candidate(slot, &mut BufReader::new(&zip))?;
+                let exposed = crate::lp_ota_source::FileStamp::read(&zip)?;
+                let digest = crate::lp_ota_source::digest(&zip, exposed, || ctx.shared.cancelled())?;
+                ensure!(digest == crate::lp_ota_source::CAPTURED_OTA_SHA256, "automatic LP maintenance requires the exact reviewed official .211 ZIP");
+                ensure!(crate::lp_ota_source::FileStamp::read(&file)? == stamp, "confirmed OTA source changed");
+                return Ok(Done::Handoff(ConfirmedLpOta { file, stamp, digest }));
+            }
+            return Err(error.context("cannot safely repair super LP capacity before OTA"));
+        }
+    }
+    if repair_capacity && !verified {
+        match verify_signature(ctx, size)? {
+            Verdict::Signed => (),
+            Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+            Verdict::Unsigned | Verdict::Unverified => return Ok(Done::Decided(Outcome::Refused(Refusal::Unverified))),
+        }
+    }
+    if ctx.shared.cancelled() { return Ok(Done::Decided(Outcome::Cancelled)); }
+    // The direct OTA path leaves vendor_boot/vbmeta to update_engine.
+    if ctx.options.pgz110_payload_policy && (ctx.options.keep || ctx.options.disable_avb) {
+        let _ = kmsg("install: PGZ110 direct OTA; no automatic Skyward retention or AVB changes");
+    }
     ctx.send(Event::Installing { version });
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
     detach_once(ctx)?;
+    if repair_capacity {
+        crate::lp_capacity::repair_before_ota().context("repair super LP capacity before starting the OTA")?;
+    }
     // update_engine mounts /metadata itself, as in the stock recovery, keeps
     // the update's state there, and unmounts it when done. The recovery
     // reads the state from it read-only again afterwards.
@@ -592,7 +794,11 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     if skyward_block::mount::is_mount_point(metadata)? {
         skyward_block::mount::umount(metadata)?;
     }
-    let code = apply(ctx, mount, update);
+    let mut apply_payload = || apply(ctx, update);
+    let code = match ctx.ota_runtime {
+        Some(runtime) => runtime(&mut apply_payload),
+        None => apply_payload(),
+    };
     if let Err(e) = remount_metadata() {
         let _ = kmsg(&format!("install: /metadata not mounted again: {e:#}"));
     }
@@ -682,7 +888,7 @@ enum Line {
 
 /// Run update_engine on the package, telling the screen how far it is,
 /// and give its exit code.
-fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
+fn apply(ctx: &Context, update: &Update) -> Result<i32> {
     let (status_read, status_write) = pipe()?;
     let status_fd = status_write.as_raw_fd();
     let mut command = std::process::Command::new(ota::PROGRAM);
@@ -724,9 +930,10 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
         })
     });
 
-    let total = update.payload_size;
-    let mut stage = Stage::Writing { done: 0, total };
-    ctx.send(Event::Progress(stage.clone()));
+    // Until the engine reports operations, leave the UI indeterminate/ready.
+    // FUSE's furthest offset is not a count of payload data written.
+    let mut stage = None;
+    let mut operations = None;
     let mut told = Instant::now();
     let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
     loop {
@@ -735,23 +942,30 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             Ok(Line::Status(Status::Error(code))) => error = Some(code),
             Ok(Line::Log(Log::Partition(_))) => partitions += 1,
             Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
+            Ok(Line::Log(Log::Operations { done, total })) => {
+                if operations.is_none_or(|(previous, previous_total)| total == previous_total && done >= previous) {
+                    operations = Some((done, total));
+                }
+            }
             Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
             Err(RecvTimeoutError::Timeout) => {}
             // Both outputs closed: the program has ended.
             Err(RecvTimeoutError::Disconnected) => break,
         }
         let now = if finishing {
-            Stage::Finishing
+            Some(Stage::Finishing)
         } else if let Some((index, partition)) = &verifying {
-            Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
+            Some(Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() })
         } else {
-            Stage::Writing { done: mount.served().saturating_sub(update.payload_offset).min(total), total }
+            operations.map(|(done, total)| Stage::Writing { done, total })
         };
-        let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
-        if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
-            stage = now;
-            ctx.send(Event::Progress(stage.clone()));
-            told = Instant::now();
+        if let Some(now) = now {
+            let moved_on = stage.as_ref().is_none_or(|old| std::mem::discriminant(old) != std::mem::discriminant(&now));
+            if stage.as_ref() != Some(&now) && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
+                stage = Some(now.clone());
+                ctx.send(Event::Progress(now));
+                told = Instant::now();
+            }
         }
     }
     let ended = child.wait().context("wait for update_engine")?;
@@ -839,6 +1053,9 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
             Ok(other) => bail!("a script waiting to be agreed to was told {other:?}"),
         }
     }
+    // Do not apply PGZ110 payload-only options to scripts. The normal
+    // signature/confirmation checks above and standalone Recovery retention
+    // below are independent of those options.
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     extract_script()?;
     shell_at_sbin()?;
@@ -1076,6 +1293,16 @@ fn banner(mode: &str) -> Vec<u8> {
 
 fn failed(e: anyhow::Error) -> Outcome {
     Outcome::Failed(Failure::Error(format!("{e:#}")))
+}
+
+/// A partial Virtual A/B package is either restored by the dedicated path or
+/// refused here: on this profile it never falls through to the OEM engine,
+/// which was observed writing a B layout over live A data.
+fn factory_route(factory: bool, origin: Origin, wipe: bool, resumed: bool, has_restore: bool) -> Result<bool> {
+    if !factory { return Ok(false); }
+    crate::factory_preflight::admit_partial_vab_restore(
+        origin == Origin::File, wipe, resumed, has_restore)?;
+    Ok(true)
 }
 
 /// A pipe, both ends closed on exec.

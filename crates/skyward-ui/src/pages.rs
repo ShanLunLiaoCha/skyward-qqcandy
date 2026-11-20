@@ -3,7 +3,7 @@ use crate::app::{
     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
-    USB_DRIVE_WANTED, WIPES, installs, starting,
+    USB_DRIVE_WANTED, WIPES, OTA_DIRECTORY, OtaStatus, installs, starting,
 };
 use crate::canvas::Canvas;
 use crate::color::Rgba;
@@ -20,7 +20,7 @@ use crate::tr;
 use crate::icons::{self, Icon};
 use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard, SystemMark, Tone, Trail};
 use skyward_info::{DeviceInfo, VERSION};
-use skyward_install::{Outcome, Reflash, Refusal, Stage};
+use skyward_install::{FactoryStep, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
@@ -69,6 +69,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Wipe => wipe(cx),
         Screen::Mount => mount(cx),
         Screen::Install => install(cx),
+        Screen::OtaModels | Screen::OtaGenerations(_) | Screen::OtaVersions(..) | Screen::OtaDownload => ota_catalogue(cx, screen),
         Screen::Choose(place) => choose(cx, place),
         Screen::Installing => installing(cx),
         Screen::About => about(cx),
@@ -129,6 +130,8 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Slot => (["滑动以切换", "滑動以切換", "Slide to switch"], true),
         Confirm::FactoryReset => (["滑动以恢复出厂设置", "滑動以恢復原廠設定", "Slide to factory reset"], true),
         Confirm::DeleteEntry | Confirm::DeleteBackup => (["滑动以删除", "滑動以刪除", "Slide to delete"], true),
+        Confirm::Install if matches!(s.install, Install::ConfirmingFactory { .. }) => (
+            ["滑动以覆盖 A 槽系统", "滑動以覆寫 A 槽系統", "Slide to overwrite the slot A system"], true),
         Confirm::Install => (INSTALL, false),
         Confirm::InstallWipe => (["滑动以安装并清除", "滑動以安裝並清除", "Slide to install and wipe"], true),
         Confirm::RunScript => (INSTALL, true),
@@ -628,10 +631,14 @@ pub fn specs(cx: &Ctx) -> Frame {
     if let Some(r) = &i.android {
         y = widgets::info_card(&mut c, t, f, y + gap, &[(l.pick(ANDROID_VERSION), fmt::android(l, r, i.security_patch.as_ref()))]);
     }
-    y = widgets::info_card(&mut c, t, f, y + gap, &[
+    let mut versions = vec![
         (l.pick(["Recovery 版本", "Recovery 版本", "Recovery version"]), format!("Skyward {VERSION}")),
         (l.pick(["内核版本", "核心版本", "Kernel version"]), i.kernel.clone()),
-    ]);
+    ];
+    if i.codename == "OP5911" {
+        versions.insert(1, (l.pick(["Recovery 构建者", "Recovery 建置者", "Recovery builder"]), "山轮料叉".to_owned()));
+    }
+    y = widgets::info_card(&mut c, t, f, y + gap, &versions);
 
     let mut boot = Vec::new();
     if let Some(s) = i.slot {
@@ -864,9 +871,7 @@ pub fn install(cx: &Ctx) -> Frame {
         facts.push((l.pick(SECURITY_PATCH), fmt::patch(l, p)));
     }
     if let Some(s) = i.slot {
-        let (slot, other) = (s.letter(), s.other().letter());
-        let detail = tr!(l, "{slot}，系统更新将安装到槽位 {other}", "{slot}，系統更新將安裝到槽位 {other}", "{slot}, and a system update installs to slot {other}");
-        facts.push((l.pick(CURRENT_SLOT), detail));
+        facts.push((l.pick(CURRENT_SLOT), s.letter().to_string()));
     }
     let ways = l.pick(["安装方式", "安裝方式", "Ways to install"]);
     let y = if facts.is_empty() {
@@ -904,20 +909,22 @@ pub fn install(cx: &Ctx) -> Frame {
     rows.push(Row::new(install_title(l, Source::File(Place::UsbDrive))).icon(PURPLE, Icon::UsbDrive).subtitle(l.pick(usb)));
     let sideload = l.pick(["在电脑上运行 adb sideload", "在電腦上執行 adb sideload", "Run adb sideload on the computer"]);
     rows.push(Row::new(install_title(l, Source::Computer)).icon(GREEN, Icon::Usb).subtitle(sideload));
+    rows.push(Row::new(l.pick(["下载 OTA 更新包", "下載 OTA 更新檔", "Download an OTA package"]))
+        .icon(BLUE, Icon::Layers).subtitle(l.pick(["按机型和 ColorOS 版本选择", "依機型與 ColorOS 版本選擇", "Browse by model and ColorOS version"])));
     let methods = widgets::list(&mut c, t, f, y, &rows);
     let from_usb = Action::Open(Screen::Choose(Place::UsbDrive));
-    let mut out = hits(&methods.rows[methods.rows.len() - 3..], &[from_storage, from_usb, Action::Sideload]);
+    let mut out = hits(&methods.rows[methods.rows.len() - 4..], &[from_storage, from_usb, Action::Sideload, Action::Open(Screen::OtaModels)]);
     // A phone that can hold a second system installs one from here too.
     let what = l.pick(match cx.state.dual_boot {
         true => [
-            "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot; a second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 系统更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 系統更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
         ],
         false => [
-            "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 系统更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 系統更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. Choosing a file lists only folders and .zip and .img files.",
         ],
     });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
@@ -927,18 +934,146 @@ pub fn install(cx: &Ctx) -> Frame {
     out.extend(hits(&signature.rows, &[Action::Toggle(Switch::Signature)]));
     let note = l.pick(["开启后，仅安装带有本机官方签名的刷机包。", "開啟後，僅安裝帶有本機官方簽章的刷機包。", "When on, only zips signed with this phone's official keys install."]);
     let mut y = widgets::footnote(&mut c, t, f, signature.bottom, note);
-    if cx.state.recovery_partitions {
+    if cx.state.recovery_partitions || cx.state.vendor_boot_retention {
         let row = Row::new(l.pick(["自动重新刷入 Skyward", "自動重新刷入 Skyward", "Flash Skyward again"])).trail(Trail::Switch(cx.state.keep_recovery));
         let options = widgets::list(&mut c, t, f, y + t.m.card_gap, &[row]);
         out.extend(hits(&options.rows, &[Action::Toggle(Switch::KeepRecovery)]));
-        let note = l.pick([
+        let note = if cx.state.vendor_boot_retention { l.pick([
+            "仅面向本机官方全量 OTA。本版本直接安装，不会自动保留 Skyward；安装后可能恢复原厂 Recovery。",
+            "僅適用於本機官方完整 OTA。本版本直接安裝，不會自動保留 Skyward；安裝後可能恢復原廠 Recovery。",
+            "For full official OTAs for this device only. This build installs directly without retaining Skyward; the update may restore stock Recovery.",
+        ]) } else { l.pick([
             "开启后，安装系统更新或刷机包时被覆盖的 recovery 分区将重新刷入 Skyward。",
             "開啟後，安裝系統更新或刷機包時被覆寫的 recovery 分割區將重新刷入 Skyward。",
             "When on, Skyward goes back into the recovery partitions a system update or flashable zip writes over.",
-        ]);
+        ]) };
+        y = widgets::footnote(&mut c, t, f, options.bottom, note);
+    }
+    if cx.state.offers_disable_avb() {
+        let forced = cx.state.avb_forced_by_retention();
+        let row = Row::new(l.pick(["禁用 AVB", "停用 AVB", "Disable AVB"])).trail(Trail::Switch(cx.state.install_disable_avb()));
+        let options = widgets::list(&mut c, t, f, y + t.m.card_gap, &[row]);
+        if !forced { out.extend(hits(&options.rows, &[Action::Toggle(Switch::DisableAvb)])); }
+        let note = if forced { l.pick([
+            "自动重新刷入 Skyward 已开启，必须禁用 AVB，不能单独关闭。",
+            "自動重新刷入 Skyward 已開啟，必須停用 AVB，不能單獨關閉。",
+            "Retaining Skyward requires AVB off. This setting is locked on.",
+        ]) } else { l.pick([
+            "仅在兼容的单 A 恢复中生效。请在选择 ZIP 前设置；普通 OTA 不使用此选项。",
+            "僅在相容的單 A 還原中生效。請在選擇 ZIP 前設定；一般 OTA 不使用此選項。",
+            "Applies only to compatible single-A restores. Set it before choosing the ZIP; ordinary OTAs ignore it.",
+        ]) };
         y = widgets::footnote(&mut c, t, f, options.bottom, note);
     }
     Frame::new(t, fit(c, t, y), out, l.pick(["安装", "安裝", "Install"]), top)
+}
+
+fn ota_model_name(l: Lang, model: &str) -> &str {
+    match model {
+        "PGZ110" => l.pick(["一加 Ace 竞速版", "一加 Ace 競速版", "OnePlus Ace Racing Edition"]),
+        "PGJM10" => l.pick(["OPPO K10 国行", "OPPO K10 中國版", "OPPO K10 (China)"]),
+        other => other,
+    }
+}
+
+fn ota_catalogue(cx: &Ctx, screen: Screen) -> Frame {
+    use crate::ota_catalog::GROUPS;
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let top = t.m.content_top;
+    let mut rows = Vec::new();
+    let mut actions = Vec::new();
+    let mut y = top;
+    let mut note = None;
+    let generation_labels: Vec<String> = match screen {
+        Screen::OtaGenerations(model) => GROUPS.get(model).into_iter().flat_map(|m| m.generations)
+            .map(|g| format!("ColorOS {}", g.generation)).collect(),
+        _ => Vec::new(),
+    };
+    let title = match screen {
+        Screen::OtaModels => {
+            for (model, group) in GROUPS.iter().enumerate() {
+                rows.push(Row::new(ota_model_name(l, group.model)).icon(BLUE, Icon::Phone).subtitle(group.model));
+                actions.push(Action::Open(Screen::OtaGenerations(model)));
+            }
+            l.pick(["选择机型", "選擇機型", "Choose a model"])
+        }
+        Screen::OtaGenerations(model) => {
+            if let Some(group) = GROUPS.get(model) {
+                y = widgets::section_first(&mut c, t, f, top, group.model);
+                for (generation, label) in generation_labels.iter().enumerate() {
+                    rows.push(Row::new(label).icon(BLUE, Icon::Layers));
+                    actions.push(Action::Open(Screen::OtaVersions(model, generation)));
+                }
+            }
+            l.pick(["选择 ColorOS", "選擇 ColorOS", "Choose ColorOS"])
+        }
+        Screen::OtaVersions(model, generation) => {
+            if let Some(model_group) = GROUPS.get(model) && let Some(group) = model_group.generations.get(generation) {
+                let heading = format!("{} · {}", model_group.model, group.generation);
+                y = widgets::section_first(&mut c, t, f, top, &heading);
+                for (package, entry) in group.packages.iter().enumerate() {
+                    rows.push(Row::new(entry.version).icon(BLUE, Icon::Layers));
+                    actions.push(Action::SelectOta(package));
+                }
+            }
+            l.pick(["选择版本", "選擇版本", "Choose a version"])
+        }
+        Screen::OtaDownload => {
+            if let Some(job) = &s.ota_download {
+                if let Some(model) = GROUPS.get(job.model) && let Some(group) = model.generations.get(job.generation)
+                    && let Some(package) = group.packages.get(job.package) {
+                    let heading = format!("{} · {}", model.model, group.generation);
+                    y = widgets::section_first(&mut c, t, f, top, &heading);
+                    y = widgets::list(&mut c, t, f, y, &[Row::new(package.version).icon(BLUE, Icon::Layers).trail(Trail::None)]).bottom + t.m.card_gap;
+                }
+                match &job.status {
+                    OtaStatus::Downloading | OtaStatus::Cancelling => {
+                        let cancelling = job.status == OtaStatus::Cancelling;
+                        let detail = fmt::bytes(job.downloaded);
+                        let (detail, share) = match job.total {
+                            Some(total) => (format!("{detail} / {}", fmt::bytes(total)), Some((job.downloaded as f32 / total as f32).min(1.0))),
+                            None => (detail, None),
+                        };
+                        let label = if cancelling { l.pick(["正在取消", "正在取消", "Cancelling"]) } else { l.pick(DOWNLOADING) };
+                        y = widgets::progress_card(&mut c, t, f, y, label, &detail, share) + t.m.card_gap;
+                        if !cancelling {
+                            rows.push(Row::new(l.pick(["取消下载", "取消下載", "Cancel download"])));
+                            actions.push(Action::CancelOta);
+                        }
+                    }
+                    OtaStatus::Cancelled | OtaStatus::Failed(_) => {
+                        let label = if let OtaStatus::Failed(why) = &job.status {
+                            note = Some(why.as_str());
+                            l.pick(["下载失败", "下載失敗", "Download failed"])
+                        } else {
+                            l.pick(["已取消下载", "已取消下載", "Download cancelled"])
+                        };
+                        y = widgets::section_first(&mut c, t, f, y, label);
+                        rows.push(Row::new(l.pick(["重试下载", "重試下載", "Retry download"])));
+                        actions.push(Action::RetryOta);
+                    }
+                    OtaStatus::Ready(path) => {
+                        rows.push(Row::new(l.pick(["安装", "安裝", "Install"]))
+                            .icon(GREEN, Icon::Layers).subtitle(l.pick(["下载完成", "下載完成", "Download complete"])));
+                        actions.push(Action::InstallOta);
+                        note = Some(path.as_str());
+                    }
+                }
+            }
+            l.pick(["OTA 下载", "OTA 下載", "OTA download"])
+        }
+        _ => unreachable!("only OTA catalogue screens use this page"),
+    };
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    let out = hits(&list.rows, &actions);
+    y = list.bottom;
+    if let Some(note) = note { y = widgets::footnote(&mut c, t, f, y, note); }
+    let destination = tr!(l, "保存到 {OTA_DIRECTORY}", "儲存到 {OTA_DIRECTORY}", "Saves to {OTA_DIRECTORY}");
+    y = widgets::footnote(&mut c, t, f, y, &destination);
+    if !s.data.storage_open() { y = widgets::footnote(&mut c, t, f, y, l.pick(DECRYPT_NEEDED)); }
+    if s.wlan.is_some() && !s.online() { y = widgets::footnote(&mut c, t, f, y, l.pick(WLAN_FIRST)); }
+    Frame::new(t, fit(c, t, y), out, title, top)
 }
 
 const SECURITY_PATCH: Text = ["安全补丁", "安全性修補程式", "Security patch"];
@@ -985,21 +1120,46 @@ fn percent(share: f32) -> u32 {
 /// Where an update stands, and the share of its step done when known.
 fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
     match stage {
-        Some(Stage::Writing { done, total }) => {
-            let s = share(*done, *total);
+        Some(Stage::Writing { done, total }) if *total > 0 && done == total => (
+            l.pick(["写入操作已完成，等待校验。", "寫入操作已完成，等待驗證。", "Write operations complete; waiting for verification."]).into(), None),
+        Some(Stage::Writing { done, total }) if *total > 0 && done < total => {
+            let s = share(*done, *total).min(0.99);
             let p = percent(s);
-            (tr!(l, "第 1 步，共 3 步：写入新系统 {p}%", "第 1 步，共 3 步：寫入新系統 {p}%", "Step 1 of 3: writing the new system {p}%"), Some(s))
+            (tr!(l, "第 1 步，共 3 步：写入操作已完成 {p}%", "第 1 步，共 3 步：寫入操作已完成 {p}%", "Step 1 of 3: write operations {p}% complete"), Some(s))
         }
         Some(Stage::Verifying { index, count, partition }) => {
             let n = index + 1;
             let said = tr!(l, "第 2 步，共 3 步：校验 {partition}（{n}/{count}）", "第 2 步，共 3 步：驗證 {partition}（{n}/{count}）", "Step 2 of 3: verifying {partition} ({n}/{count})");
             (said, Some(*index as f32 / *count as f32))
         }
+        Some(Stage::Factory(step)) => factory_stage(l, step),
         Some(Stage::Finishing) => (l.pick(["第 3 步，共 3 步：完成安装", "第 3 步，共 3 步：完成安裝", "Step 3 of 3: finishing"]).into(), None),
         Some(Stage::Reflashing { done, total }) => (l.pick(REFLASHING).into(), Some(*done as f32 / *total as f32)),
-        Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
+        Some(Stage::Writing { .. } | Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
             (l.pick(GETTING_READY).into(), None)
         }
+    }
+}
+
+/// A local single-A restore, worded in the language the screen is set to.
+fn factory_stage(l: Lang, step: &FactoryStep) -> (String, Option<f32>) {
+    match step {
+        FactoryStep::ReadingPackage => (l.pick(["正在读取更新包清单", "正在讀取更新檔清單", "Reading the package manifest"]).into(), None),
+        FactoryStep::RepackingVendorBoot => (l.pick(["正在重打包 vendor_boot", "正在重打包 vendor_boot", "Repacking vendor_boot"]).into(), None),
+        FactoryStep::CoreImages => (l.pick(["正在准备启动链镜像", "正在準備啟動鏈映像", "Staging the boot-chain images"]).into(), None),
+        FactoryStep::LogicalVolume { index, count, name } => (tr!(l, "正在生成 A 槽系统 {index}/{count}：{name}", "正在產生 A 槽系統 {index}/{count}：{name}", "Building slot A {index}/{count}: {name}").into(),
+            Some(*index as f32 / (*count).max(1) as f32)),
+        FactoryStep::HashingSuper { percent } => (tr!(l, "正在校验新系统镜像 {percent}%", "正在驗證新系統映像 {percent}%", "Verifying the new system image {percent}%").into(),
+            Some(*percent as f32 / 100.0)),
+        FactoryStep::Physical { index, count, name } => (tr!(l, "正在准备固件 {index}/{count}：{name}", "正在準備韌體 {index}/{count}：{name}", "Staging firmware {index}/{count}: {name}").into(),
+            Some(*index as f32 / (*count).max(1) as f32)),
+        FactoryStep::Publishing => (l.pick(["正在完成镜像准备", "正在完成映像準備", "Finishing the prepared images"]).into(), None),
+        FactoryStep::Claiming { index, count, name } => (tr!(l, "正在独占分区 {index}/{count}：{name}", "正在獨佔分割區 {index}/{count}：{name}", "Claiming partition {index}/{count}: {name}").into(),
+            Some(*index as f32 / (*count).max(1) as f32)),
+        FactoryStep::Writing { index, count, name } => (tr!(l, "正在写入 {index}/{count}：{name}", "正在寫入 {index}/{count}：{name}", "Writing {index}/{count}: {name}").into(),
+            Some(*index as f32 / (*count).max(1) as f32)),
+        FactoryStep::Syncing { name } => (tr!(l, "正在同步 {name}", "正在同步 {name}", "Syncing {name}").into(), None),
+        FactoryStep::Activating => (l.pick(["所有分区已写入并同步，正在设为 A 槽", "所有分割區已寫入並同步，正在設為 A 槽", "All partitions written and synced; setting slot A"]).into(), None),
     }
 }
 
@@ -1262,15 +1422,7 @@ pub fn installing(cx: &Ctx) -> Frame {
                     Some(v) => tr!(l, "安装 {v}", "安裝 {v}", "Install {v}"),
                     None => l.pick(["安装系统更新", "安裝系統更新", "Install the system update"]).into(),
                 };
-                let detail = match i.slot.map(|s| s.other().letter()) {
-                    Some(slot) => tr!(
-                        l,
-                        "新系统将安装到槽位 {slot}，重启后将从该槽位启动。",
-                        "新系統將安裝到槽位 {slot}，重新啟動後將從該槽位啟動。",
-                        "The new system installs to slot {slot}, which starts after a reboot."
-                    ),
-                    None => l.pick(["重启后将从新系统启动。", "重新啟動後將從新系統啟動。", "The new system starts after a reboot."]).into(),
-                };
+                let detail = l.pick(["确认后开始安装系统更新。", "確認後開始安裝系統更新。", "Confirm to install the system update."]).into();
                 (title, GREEN, Icon::Install, detail, Confirm::Install)
             };
             let y = widgets::list(&mut c, t, f, top, &[standing(&title, color, icon, &detail)]).bottom;
@@ -1280,6 +1432,24 @@ pub fn installing(cx: &Ctx) -> Frame {
             let note = l.pick(["返回将取消安装，不会写入任何内容。", "返回將取消安裝，不會寫入任何內容。", "Going back cancels the install without writing anything."]);
             widgets::footnote(&mut c, t, f, track.y + track.h, note)
         }
+        Install::ConfirmingFactory { version } => {
+            let title = match version {
+                Some(v) => tr!(l, "恢复 {v} 到 A 槽", "還原 {v} 到 A 槽", "Restore {v} to slot A"),
+                None => l.pick(["恢复 A 槽系统", "還原 A 槽系統", "Restore the slot A system"]).into(),
+            };
+            let detail = l.pick([
+                "替换 A 槽逻辑系统并写入两槽物理固件。B 槽无独立系统可回退。不格式化数据，不验证 ZIP 签名。保留此 Recovery 需要先启用安装页的关闭 AVB 选项。",
+                "替換 A 槽邏輯系統並寫入兩槽實體韌體。B 槽無獨立系統可回復。不格式化資料，不驗證 ZIP 簽章。保留此 Recovery 需要先啟用安裝頁的關閉 AVB 選項。",
+                "Replaces the logical system in slot A and writes firmware to both slots. No system fallback in B. No data format or ZIP signature check. Enable the install page’s AVB-off option to retain this Recovery.",
+            ]);
+            let y = widgets::list(&mut c, t, f, top, &[standing(&title, RED, Icon::Install, detail)]).bottom;
+            let which = Confirm::Install;
+            let (label, danger) = confirm_label(which, cx.state);
+            let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
+            out.push(Hit { rect: track, action: Action::Confirm(which) });
+            let note = l.pick(["返回将取消安装。", "返回將取消安裝。", "Going back cancels the install."]);
+            widgets::footnote(&mut c, t, f, track.y + track.h, note)
+        }
         Install::Updating { version, stage, overwriting } => {
             let title = match version {
                 Some(v) => tr!(l, "正在安装 {v}", "正在安裝 {v}", "Installing {v}"),
@@ -1287,12 +1457,7 @@ pub fn installing(cx: &Ctx) -> Frame {
             };
             let (detail, done) = update_stage(l, stage.as_ref());
             let y = widgets::progress_card(&mut c, t, f, top, &title, &detail, done);
-            let until = until_installed(l, s.source);
-            let note = match i.slot.map(|s| s.other().letter()) {
-                Some(slot) => tr!(l, "{until}新系统将安装到槽位 {slot}。", "{until}新系統將安裝到槽位 {slot}。", "{until} The new system installs to slot {slot}."),
-                None => until.to_string(),
-            };
-            let y = widgets::footnote(&mut c, t, f, y, &note);
+            let y = widgets::footnote(&mut c, t, f, y, until_installed(l, s.source));
             if *overwriting {
                 let note = l.pick([
                     "正在覆盖当前系统，安装完成前重启将无法进入系统。",
@@ -1482,15 +1647,9 @@ fn finished(
     let installed = l.pick(["安装成功", "安裝成功", "Installed"]);
     let nothing_written = l.pick(["未写入任何内容。", "未寫入任何內容。", "Nothing was written."]);
     match outcome {
-        Outcome::Installed { slot, .. } => {
-            let slot = slot.letter();
-            let detail = tr!(
-                l,
-                "新系统已安装到槽位 {slot}，重启后将从该槽位启动。",
-                "新系統已安裝到槽位 {slot}，重新啟動後將從該槽位啟動。",
-                "The new system is installed to slot {slot}, which starts after a reboot."
-            );
-            let y = widgets::list(c, t, f, top, &[standing(installed, GREEN, Icon::Install, &detail)]).bottom;
+        Outcome::Installed { .. } => {
+            let detail = l.pick(["系统更新已安装，可以重启到系统。", "系統更新已安裝，可以重新啟動到系統。", "The system update is installed. You can reboot to system."]);
+            let y = widgets::list(c, t, f, top, &[standing(installed, GREEN, Icon::Install, detail)]).bottom;
             let next = widgets::list(c, t, f, y + gap, &[restart]);
             out.extend(hits(&next.rows, &[Action::RebootTo(Target::System)]));
             let y = reflashed(c, cx, next.bottom);
@@ -4037,7 +4196,22 @@ mod tests {
         assert_eq!(script_stage(l, Some(&Stage::Script { thousandths: 250 }), &said), ("- Flashing boot", Some(0.25)), "past a blank line");
         assert_eq!(script_stage(l, Some(&Stage::Reflashing { done: 1, total: 4 }), &said), ("正在重新刷入 Skyward", Some(0.25)));
         assert_eq!(update_stage(Lang::En, Some(&Stage::Reflashing { done: 3, total: 4 })), ("Flashing Skyward again".to_string(), Some(0.75)));
-        assert_eq!(update_stage(Lang::Hant, Some(&Stage::Writing { done: 1, total: 4 })).0, "第 1 步，共 3 步：寫入新系統 25%");
+        assert_eq!(update_stage(Lang::Hant, Some(&Stage::Writing { done: 1, total: 4 })).0, "第 1 步，共 3 步：寫入操作已完成 25%");
+    }
+
+    #[test]
+    fn ota_catalogue_names_match_the_supplied_codes() {
+        assert_eq!(ota_model_name(Lang::Hans, "PGZ110"), "一加 Ace 竞速版");
+        assert_eq!(ota_model_name(Lang::Hans, "PGJM10"), "OPPO K10 国行");
+    }
+
+    #[test]
+    fn ota_write_progress_does_not_promise_install_completion() {
+        assert_eq!(update_stage(Lang::Hans, None).1, None);
+        assert_eq!(update_stage(Lang::Hans, Some(&Stage::Writing { done: 0, total: 0 })).1, None);
+        assert_eq!(update_stage(Lang::Hans, Some(&Stage::Writing { done: 999, total: 1000 })).1, Some(0.99));
+        assert_eq!(update_stage(Lang::Hans, Some(&Stage::Writing { done: 1000, total: 1000 })),
+            ("写入操作已完成，等待校验。".into(), None));
     }
 
     #[test]

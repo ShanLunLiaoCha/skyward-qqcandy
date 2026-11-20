@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Skyward Recovery 移植</string>
+    <string name="heading">手机端 Recovery 移植</string>
+    <string name="introduction">内置 Fix50 · 1600 资源。离线重打包，准备阶段不写分区。</string>
+    <string name="prepare_title">准备移植镜像</string>
+    <string name="author">作者：山轮料叉</string>
+    <string name="choose_model">选择本机型号</string>
+    <string name="pgz110">一加 Ace 竞速版 · PGZ110</string>
+    <string name="pgjm10">OPPO K10 国行 · PGJM10</string>
+    <string name="prepare">申请 Root 并准备</string>
+    <string name="flash">确认刷入当前槽</string>
+    <string name="export_vendor">导出 vendor_boot 备份</string>
+    <string name="export_vbmeta">导出 vbmeta 备份</string>
+    <string name="details">准备结果</string>
+    <string name="logs">操作日志</string>
+    <string name="idle">选择机型后点「申请 Root 并准备」。</string>
+    <string name="preparing">正在等待 Root 授权或准备镜像…</string>
+    <string name="ready">重打包完成，尚未写入分区。请先把两份原始备份分别导出，再确认刷入。</string>
+    <string name="flashing">正在写入。请勿重启、切换槽或结束应用。</string>
+    <string name="flashed">刷入操作已完成。未自动重启。请保留备份。</string>
+    <string name="prepare_failed">准备未完成：%1$s</string>
+    <string name="flash_failed">写入未完成：%1$s。可能已写入部分数据，请保留备份并先检查状态，不要直接重启。</string>
+    <string name="exporting">正在导出备份…</string>
+    <string name="exported">备份已分别导出，现在可以确认刷入。</string>
+    <string name="exported_only">备份已导出。</string>
+    <string name="export_one_left">一份备份已导出，请继续导出另一份。</string>
+    <string name="export_distinct">两份备份必须保存为不同文件，请选择其他文件名。</string>
+    <string name="export_invalid_uri">系统文件保存器没有返回有效文档。</string>
+    <string name="export_vendor_done">重新导出 vendor_boot 备份（已导出）</string>
+    <string name="export_vbmeta_done">重新导出 vbmeta 备份（已导出）</string>
+    <string name="export_failed">备份未能完整导出：%1$s。请勿使用此次导出的文件，应用内原备份未改动。</string>
+    <string name="export_picker_failed">未能打开系统文件保存器：%1$s</string>
+    <string name="busy">操作尚未完成，请稍候。</string>
+    <string name="prepared_files">当前槽：%1$s\n\n待写 vendor_boot：\n%2$s\n\n待写 vbmeta：\n%3$s\n\nvendor_boot 原始备份：\n%4$s\n\nvbmeta 原始备份：\n%5$s</string>
+    <string name="confirm_title">将修改启动分区</string>
+    <string name="confirm_message">将修改当前槽（%1$s）的顶层 vbmeta AVB 标志，并写入同一槽的 vendor_boot。必须已解锁 Bootloader；已解锁也不保证能启动。此操作不自动重启。请确认已有可用备份和救援方式。</string>
+    <string name="confirm_flash">刷入分区</string>
+    <string name="cancel">取消</string>
+    <string name="backup_vendor_name">skyward-vendor_boot-backup.img</string>
+    <string name="backup_vbmeta_name">skyward-vbmeta-backup.img</string>
+    <string name="unknown_error">未知错误</string>
+</resources>

@@ -139,6 +139,50 @@ pub struct Snapshots {
     _lock: File,
 }
 
+/// Held across a full restore, in addition to the kernel-exclusive target claims.
+/// Advisory locking protects cooperating users only; the caller still needs
+/// verified mounts, no merge in BootControl and kernel holder checks.
+pub struct RestoreLock {
+    _metadata: File,
+    _ota: Option<Snapshots>,
+}
+
+fn exclusive_directory(dir: &Path) -> Result<File> {
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY).open(dir)?;
+    ensure!(file.metadata()?.is_dir(), "restore lock path is not a directory");
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("exclusively lock {}", dir.display()));
+    }
+    Ok(file)
+}
+
+impl RestoreLock {
+    fn lock_in(metadata: &Path) -> Result<Self> {
+        let root = exclusive_directory(metadata)?;
+        let ota = metadata.join("ota");
+        let snapshots = match fs::symlink_metadata(&ota) {
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect existing OTA metadata"),
+            Ok(meta) => {
+                ensure!(meta.is_dir(), "OTA metadata is not a real directory");
+                let lock = exclusive_directory(&ota)?;
+                let snaps = Snapshots { dir:ota, exclusive:true, _lock:lock };
+                ensure!(matches!(snaps.state()?, UpdateState::None | UpdateState::MergeCompleted | UpdateState::Cancelled),
+                    "unfinished snapshot update prevents restore");
+                let folder = snaps.dir.join(SNAPSHOTS);
+                match fs::read_dir(&folder) {
+                    Ok(mut entries) => ensure!(entries.next().is_none(), "snapshot records remain; restore cannot discard them"),
+                    Err(error) if error.kind() == ErrorKind::NotFound => (),
+                    Err(error) => return Err(error).context("inspect snapshot record directory"),
+                }
+                ensure!(!snaps.dir.join(WITHOUT_SLOT_SWITCH).try_exists()?, "snapshot boot marker remains");
+                Some(snaps)
+            }
+        };
+        Ok(Self {_metadata:root, _ota:snapshots})
+    }
+}
+
 impl Snapshots {
     /// Take libsnapshot's lock, shared to read what it keeps or exclusive
     /// to change it; `None` where no update was ever applied.
@@ -162,6 +206,13 @@ impl Snapshots {
             }
         }
         Ok(Snapshots { dir: dir.into(), exclusive, _lock: lock })
+    }
+
+    /// Hold the existing metadata root and OTA directory during a full restore.
+    /// Does not create directories, clear snapshots, or mutate update state.
+    pub fn lock_for_restore() -> Result<RestoreLock> {
+        ensure!(skyward_block::mount::is_mount_point(Path::new("/metadata"))?, "metadata must be mounted before restore locking");
+        RestoreLock::lock_in(Path::new("/metadata"))
     }
 
     /// The update's whole status.
@@ -870,6 +921,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(SNAPSHOTS)).unwrap();
         dir
+    }
+
+    #[test]
+    fn restore_lock_never_clears_pending_records() {
+        let dir = scratch("restore-lock");
+        let clean = RestoreLock::lock_in(&dir).unwrap();
+        assert!(RestoreLock::lock_in(&dir).is_err());
+        drop(clean);
+        let ota = dir.join("ota");
+        fs::create_dir(&ota).unwrap();
+        fs::write(ota.join(STATE), b"merging").unwrap();
+        assert!(RestoreLock::lock_in(&dir).is_err());
+        assert_eq!(fs::read(ota.join(STATE)).unwrap(), b"merging");
+        fs::write(ota.join(STATE), b"merge-completed").unwrap();
+        fs::create_dir(ota.join(SNAPSHOTS)).unwrap();
+        fs::write(ota.join(SNAPSHOTS).join("vendor_a"), b"record").unwrap();
+        assert!(RestoreLock::lock_in(&dir).is_err());
+        fs::remove_file(ota.join(SNAPSHOTS).join("vendor_a")).unwrap();
+        // A failed OTA can leave an empty global state alongside genuine
+        // CREATED records. Empty state alone must not authorize repair.
+        fs::write(ota.join(STATE), []).unwrap();
+        let record = SnapshotStatus { name: "vendor_b".into(), state: PartState::Created as i32,
+            cow_file_size: 4096, ..Default::default() }.encode_to_vec();
+        let path = ota.join(SNAPSHOTS).join("vendor_b");
+        fs::write(&path, &record).unwrap();
+        assert!(RestoreLock::lock_in(&dir).is_err());
+        assert_eq!(fs::read(&path).unwrap(), record);
+        fs::remove_file(path).unwrap();
+        let ready = RestoreLock::lock_in(&dir).unwrap();
+        assert!(exclusive_directory(&ota).is_err());
+        drop(ready);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn partition(name: &str, attributes: u32) -> Partition {
