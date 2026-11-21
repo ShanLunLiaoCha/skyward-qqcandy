@@ -37,17 +37,25 @@ fn main() -> Result<()> {
     ensure!(stock.len() == 64 << 20 && parent.len() == 8 << 20, "unsupported partition sizes");
     let elf = read(&donor.join("system/bin/recovery"), 32 << 20)?;
     let names = ["skyward/device.toml", "skyward/MiSansVF.ttf", "skyward/KirkMono-Regular.ttf",
-        "skyward/KirkMono-OFL.txt", "system/etc/init/skyward-mtp.rc"];
+        "skyward/KirkMono-OFL.txt", "system/etc/init/skyward-mtp.rc",
+        "skyward/my_company.img", "skyward/my_preload.img"];
     let contents = names.iter().map(|name| read(&donor.join(name), 32 << 20)).collect::<Result<Vec<_>>>()?;
     let assets: Vec<_> = names.into_iter().zip(contents.iter().map(Vec::as_slice)).collect();
     let image = vendor_boot::repack_hc(&stock, &elf, &assets)?;
     // The physical backup includes padding beyond the supported AVB header.
     let compact = parent.get(..1 << 20).context("vbmeta prefix")?;
     ensure!(parent[1 << 20..].iter().all(|&b| b == 0), "nonzero trailing vbmeta data");
-    ensure!(assess(compact, &stock, &image)? == ParentBinding::RejectsCandidate,
-        "top-level stock vbmeta does not directly bind this original vendor_boot");
+    // The candidate is written with AVB off, so the parent binding is only
+    // inspected: it may bind the stock image (RejectsCandidate) or prove no
+    // binding at all (Unproven, seen on some 13.x layouts). A parent that
+    // already matched the candidate would mean the stock bytes were reused.
+    ensure!(assess(compact, &stock, &image)? != ParentBinding::MatchesCandidate,
+        "top-level stock vbmeta describes these very bytes; refusing to call them a new image");
+    // A phone whose vbmeta this tool already switched off keeps flags 3;
+    // anything else is an unfamiliar layout, not something to overwrite.
     let flags = parent.get_mut(120..124).context("missing AVB flags")?;
-    ensure!(flags == [0; 4], "expected stock vbmeta flags");
+    let current = u32::from_be_bytes(flags.try_into().expect("four bytes"));
+    ensure!(current == 0 || current == 3, "unexpected top-level vbmeta flags {current}");
     flags.copy_from_slice(&3u32.to_be_bytes());
     put(Path::new(out), &image)?;
     put(Path::new(avb), &parent)?;

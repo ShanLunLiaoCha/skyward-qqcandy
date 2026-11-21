@@ -1,4 +1,4 @@
-"""Extract the pinned 1600 Fix48 Recovery resources, not target-specific hardware."""
+"""Extract the pinned 1600 Fix62 Recovery resources, not target-specific hardware."""
 from pathlib import Path
 import hashlib
 import sys
@@ -7,11 +7,12 @@ root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root / 'skyward-pgz110/tools'))
 from vendor_boot import VendorBoot, CpioArchive, decompress_ramdisk
 
-DONOR = root / 'skyward-pgz110/prebuilt/vendor_boot-OP5911-1600-userdebug-FIX50-PROGRESS-UNTESTED.img'
-EXPECTED = '08b4ff9d261a36296b8010105834b1ed12fa7c9b85f897de9b9b368538ae81e6'
-ELF = '94fb8f31a4620061014603b3495b7bf27942c2ab08d463180b6a0c1663865377'
+DONOR = root / 'skyward-pgz110/prebuilt/vendor_boot-OP5911-1600-FIX62.img'
+EXPECTED = '642c22623d70655bcb444a4d1d7414a46d37fe9b25fdbc66f456497875d01061'
+ELF = '5bacb76912744c4e4499d87a962b405046de2027ebf2fb5a7f0aa857e7463852'
 NAMES = ('system/bin/recovery', 'skyward/device.toml', 'skyward/MiSansVF.ttf',
-         'skyward/KirkMono-Regular.ttf', 'skyward/KirkMono-OFL.txt', 'system/etc/init/skyward-mtp.rc')
+         'skyward/KirkMono-Regular.ttf', 'skyward/KirkMono-OFL.txt', 'system/etc/init/skyward-mtp.rc',
+         'skyward/my_company.img', 'skyward/my_preload.img')
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()

@@ -34,11 +34,26 @@ const MAX_BYTES: u64 = 128 << 30;
 /// ordinary download. There is no `Damaged` digest verdict for this path.
 pub fn fetch(agent: &ureq::Agent, url: &str, path: &Path, stop: &AtomicBool, progress: &mut dyn FnMut(Progress)) -> Result<()> {
     let uri: Uri = url.parse().context("invalid preset OTA URL")?;
-    ensure!(uri.scheme_str() == Some("https")
+    ensure!(matches!(uri.scheme_str(), Some("https") | Some("http"))
         && uri.authority().is_some_and(|authority| !authority.as_str().contains('@')),
-        "preset OTA URL must use an approved HTTPS authority without user information");
-    fetch_from(agent, url, path, stop, progress)
+        "preset OTA URL must use an approved authority without user information");
+    let secure = uri.scheme_str() == Some("https");
+    match fetch_from(agent, url, path, stop, progress) {
+        Ok(()) => Ok(()),
+        // The vendor CDN answers some recovery TLS stacks with a 403 while
+        // serving the same bytes over plain HTTP. Retrying over HTTP keeps the
+        // download possible; the payload is still checked before any write.
+        Err(error) if secure => {
+            let plain = format!("http://{}", url.strip_prefix("https://").context("unsupported URL prefix")?);
+            fetch_from(agent, &plain, path, stop, progress).with_context(||
+                format!("HTTPS download failed ({error:#}) and the plain-HTTP retry failed as well"))
+        }
+        Err(error) => Err(error),
+    }
 }
+
+/// The vendor CDN rejects browser agents; the phone's own updater sends this.
+const OTA_USER_AGENT: &str = "Dalvik/2.1.0 (Linux; U; Android 13)";
 
 fn fetch_from(agent: &ureq::Agent, url: &str, path: &Path, stop: &AtomicBool, progress: &mut dyn FnMut(Progress)) -> Result<()> {
     check_stop(stop)?;
@@ -75,7 +90,9 @@ const MAX_SEGMENTS: usize = 32_768;
 fn request(agent: &ureq::Agent, url: &str, range: &str, validator: Option<&str>, stop: &AtomicBool)
     -> Result<ureq::http::Response<ureq::Body>> {
     check_stop(stop)?;
-    let mut request = agent.get(url).header(header::RANGE, range).header(header::ACCEPT_ENCODING, "identity");
+    let mut request = agent.get(url).header(header::RANGE, range)
+        .header(header::ACCEPT_ENCODING, "identity")
+        .header(header::USER_AGENT, OTA_USER_AGENT);
     if let Some(etag) = validator { request = request.header(header::IF_RANGE, etag); }
     let response = request.config().max_redirects(0).http_status_as_error(false).build().call();
     check_stop(stop)?;
@@ -130,8 +147,13 @@ fn strong_etag(headers: &HeaderMap) -> Result<&str> {
 fn response_segment(status: u16, headers: &HeaderMap) -> Result<Segment> {
     if !matches!(status, 200 | 206) { bail!(Refused(status)); }
     ensure!(!headers.contains_key(header::TRANSFER_ENCODING), "OTA response must use Content-Length framing");
-    ensure!(single_header(headers, header::CONTENT_ENCODING)?.is_none_or(|v| v.eq_ignore_ascii_case("identity")),
-        "OTA response must not encode the byte representation");
+    // Some vendor CDNs label zip bytes as "UTF-8" or "binary". Only a real
+    // content coding changes the representation, so reject exactly those.
+    if let Some(encoding) = single_header(headers, header::CONTENT_ENCODING)? {
+        let coding = encoding.trim().to_ascii_lowercase();
+        ensure!(!matches!(coding.as_str(), "gzip" | "x-gzip" | "deflate" | "br" | "zstd" | "compress"),
+            "OTA response must not encode the byte representation ({encoding})");
+    }
     let length = decimal(single_header(headers, header::CONTENT_LENGTH)?.context("OTA response has no Content-Length")?)?;
     ensure!((1..=MAX_BYTES).contains(&length), "OTA response length outside supported limits");
     let range = single_header(headers, header::CONTENT_RANGE)?;
@@ -465,7 +487,10 @@ mod tests {
             let temp = Staged::new(&std::env::temp_dir()).unwrap();
             let path = temp.file();
             let stop = AtomicBool::new(false);
-            assert!(fetch(&agent, &url, &path, &stop, &mut |_| {}).is_err(), "public fetch requires HTTPS");
+            // The public entry point now retries over plain HTTP for the
+            // vendor CDN, so the scheme gate rejects only unknown schemes.
+            assert!(fetch(&agent, "ftp://127.0.0.1/ota.zip", &path, &stop, &mut |_| {}).is_err(),
+                "only http and https presets are accepted");
             let got = fetch_from(&agent, &url, &path, &stop, &mut |_| {});
             server.join().unwrap();
             if expected {

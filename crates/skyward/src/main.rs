@@ -1327,7 +1327,20 @@ fn prepare_vendor_boot(stock: &Path, output: &Path) -> Result<()> {
     use std::io::Write;
     let target = read_repack_input(stock, 64 << 20)?;
     let (elf, owned) = repack_donor()?;
-    let assets: Vec<_> = owned.iter().map(|(name, data)| (*name, data.as_slice())).collect();
+    let mut assets: Vec<(&str, &[u8])> = owned.iter().map(|(name, data)| (*name, data.as_slice())).collect();
+    // The two replacement images ride inside this image, so the ported
+    // Recovery can install without any file lying beside the package.
+    let mut embedded: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for name in skyward_install::vendor_boot::REPLACEMENT_ASSETS {
+        let path = Path::new("/").join(name);
+        match std::fs::read(&path) {
+            Ok(data) if !data.is_empty() => embedded.push((name, data)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+    assets.extend(embedded.iter().map(|(name, data)| (*name, data.as_slice())));
     let result = skyward_install::vendor_boot::repack(&target, &elf, &assets)?;
     // This stage emits a new file only. It cannot open an existing device or
     // output path and cannot select a slot, activate it, or write vbmeta.

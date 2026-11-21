@@ -56,9 +56,17 @@ pub(crate) fn target_sizes(payload: &payload_plan::Plan, company: u64, preload: 
     for name in &group.partitions {
         ensure!(seen.insert(name), "duplicate logical target {name}");
         if replacements.contains_key(name.as_str()) { continue; }
-        let p = source.get(name.as_str()).with_context(|| format!("target is missing image for {name}"))?;
+        // odm_dlkm and vendor_dlkm stay optional here too: a package that
+        // carries no image for them simply leaves them out of slot A.
+        const OPTIONAL: [&str; 2] = ["odm_dlkm", "vendor_dlkm"];
+        let Some(p) = source.get(name.as_str()) else {
+            ensure!(OPTIONAL.contains(&name.as_str()), "target is missing image for {name}");
+            continue;
+        };
         ensure!(sizes.insert(name.clone(), p.size).is_none(), "duplicate logical target {name}");
     }
+    // The two replacement images travel inside vendor_boot, so their
+    // destinations are always created even when the package never had them.
     for (name, size) in replacements { sizes.insert(name.to_owned(), size); }
     Ok((limit, sizes))
 }

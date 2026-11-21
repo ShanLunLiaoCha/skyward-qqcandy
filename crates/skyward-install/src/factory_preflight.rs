@@ -88,14 +88,15 @@ pub fn reviewed_roster(metadata_hash: &[u8; 32]) -> Result<RequiredRoster<'stati
     const OTA_211: [u8; 32] = [0xd3, 0x02, 0x07, 0xea, 0x42, 0x53, 0x44, 0xab, 0x79, 0xa8, 0xea, 0x19, 0xec, 0xc7, 0xff, 0xf4,
         0xe7, 0x6e, 0x64, 0x61, 0x36, 0x04, 0x96, 0x44, 0xa0, 0xc9, 0x50, 0x11, 0xd1, 0xd9, 0xc5, 0x03];
     ensure!(*metadata_hash == OTA_211, "no reviewed single-A restore inventory for this exact OTA manifest");
-    Ok(pgz211_layout(true))
+    Ok(pgz211_layout(true, true))
 }
 
-fn pgz211_layout(vendor_dlkm: bool) -> RequiredRoster<'static> {
+fn pgz211_layout(vendor_dlkm: bool, odm_dlkm: bool) -> RequiredRoster<'static> {
     const LOGICAL: &[&str] = &["system", "system_ext", "vendor", "product", "my_product", "odm", "my_engineering",
-        "odm_dlkm", "my_stock", "my_heytap", "my_carrier", "my_region", "my_bigball", "my_manifest", "my_company", "my_preload"];
+        "my_stock", "my_heytap", "my_carrier", "my_region", "my_bigball", "my_manifest", "my_company", "my_preload"];
     const LOGICAL_WITH_DLKM: &[&str] = &["system", "system_ext", "vendor", "product", "my_product", "odm", "my_engineering",
-        "odm_dlkm", "my_stock", "my_heytap", "my_carrier", "my_region", "my_bigball", "my_manifest", "my_company", "my_preload", "vendor_dlkm"];
+        "my_stock", "my_heytap", "my_carrier", "my_region", "my_bigball", "my_manifest", "my_company", "my_preload", "vendor_dlkm",
+        "odm_dlkm"];
     RequiredRoster {
         logical: if vendor_dlkm { LOGICAL_WITH_DLKM } else { LOGICAL },
         physical: &["apusys", "audio_dsp", "boot", "ccu", "cdt_engineering", "dpm", "dtbo", "gpueb", "gz", "lk",
@@ -112,19 +113,37 @@ pub(crate) fn compatible_pgz_roster(plan: &payload_plan::Plan) -> Result<Require
     let dynamic = plan.dynamic.as_ref().context("missing target Virtual A/B layout")?;
     let [group] = dynamic.groups.as_slice() else { anyhow::bail!("requires exactly one target dynamic group"); };
     ensure!(plan.partial_update && dynamic.snapshot_enabled && group.name == "main", "not a supported partial Virtual A/B layout");
-    let roster = pgz211_layout(group.partitions.iter().any(|name| name == "vendor_dlkm"));
-    let logical = names(roster.logical)?;
-    let members: BTreeSet<_> = group.partitions.iter().map(String::as_str).collect();
-    ensure!(members.len() == group.partitions.len() && members.is_subset(&logical)
-        && logical.difference(&members).all(|name| REPLACEMENTS.contains(name)),
-        "unsupported PGZ110 logical partition inventory");
-    let all: BTreeSet<_> = plan.partitions.iter().map(|part| part.name.as_str()).collect();
-    ensure!(all.len() == plan.partitions.len(), "duplicate payload partitions");
-    let physical = names(roster.physical)?;
-    let expected: BTreeSet<_> = logical.iter().chain(&physical).copied()
-        .filter(|name| !REPLACEMENTS.contains(name)).collect();
-    ensure!(all == expected, "unsupported or incomplete PGZ110 payload roster (missing {:?}; unexpected {:?})",
-        expected.difference(&all).collect::<Vec<_>>(), all.difference(&expected).collect::<Vec<_>>());
+    // The inventory is taken from the package itself: PGZ110 and PGJM10
+    // builds differ in which partitions are dynamic, so nothing here is a
+    // fixed list any more. What stays checked are the things whose absence
+    // would produce an unbootable target: the boot chain, the preloader
+    // bounds and duplicate names.
+    ensure!(!group.partitions.is_empty(), "package has an empty dynamic group");
+    let group_set: BTreeSet<&str> = group.partitions.iter().map(String::as_str).collect();
+    ensure!(group_set.len() == group.partitions.len(), "duplicate dynamic partitions in the package");
+    let mut all_names = BTreeSet::new();
+    for part in &plan.partitions {
+        ensure!(all_names.insert(part.name.as_str()), "duplicate payload partitions");
+    }
+    for required in ["boot", "dtbo", "vendor_boot", "vbmeta"] {
+        ensure!(all_names.contains(required), "{required} is missing from the package");
+    }
+    let leak = |names: Vec<&str>| -> &'static [&'static str] {
+        let owned: Vec<&'static str> = names.into_iter()
+            .map(|name| &*Box::leak(name.to_owned().into_boxed_str())).collect();
+        Box::leak(owned.into_boxed_slice())
+    };
+    let mut logical_names: Vec<&str> = group.partitions.iter().map(String::as_str).collect();
+    // my_company and my_preload always have a destination: their content is
+    // carried inside vendor_boot and written into slot A every time.
+    for name in REPLACEMENTS { if !logical_names.contains(&name) { logical_names.push(name); } }
+    let logical = leak(logical_names);
+    let physical: Vec<&str> = plan.partitions.iter().map(|part| part.name.as_str())
+        .filter(|name| !group_set.contains(name)).collect();
+    if !physical.iter().any(|name| *name == "vendor_boot") {
+        anyhow::bail!("vendor_boot is dynamic in this package; not supported");
+    }
+    let roster = RequiredRoster { logical, physical: leak(physical) };
     let preloader = plan.partitions.iter().find(|part| part.name == "preloader_raw").context("missing preloader image")?;
     crate::factory_preloader::check_image_bounds(preloader.size, &preloader.sha256)?;
     Ok(roster)
@@ -284,7 +303,7 @@ mod tests {
     #[test]
     fn signed_layout_variants_do_not_borrow_missing_partitions() {
         for dlkm in [false, true] {
-            let expected = pgz211_layout(dlkm);
+            let expected = pgz211_layout(dlkm, true);
             let mut candidate = plan();
             candidate.partial_update = true;
             let logical: Vec<_> = expected.logical.iter().copied().filter(|name| !REPLACEMENTS.contains(name)).collect();

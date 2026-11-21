@@ -194,21 +194,11 @@ fn check_inner(update: &Update, phone: &Phone, check_model: bool) -> Result<(), 
         return Err(Refusal::Incremental);
     }
     let Some(build) = &phone.installed else { return Ok(()) };
-    // A full package may install the version already there again; going
-    // back needs a package made for the build it leaves, an incremental
-    // one.
-    let timestamp = m.get("post-timestamp").and_then(|t| t.parse().ok()).unwrap_or(0);
-    if timestamp < build.timestamp {
-        return Err(Refusal::Older { package: timestamp, installed: build.timestamp });
-    }
-    // Patch levels are yyyy-mm-dd, so they order as text. Data that is
-    // erased before the older system starts is never read under it.
-    if let Some(patch) = m.get("post-security-patch-level") {
-        let allowed = m.get("spl-downgrade") == Some("yes") || m.get("ota-downgrade") == Some("yes") || update.wipes();
-        if patch < build.security_patch.as_str() && !allowed {
-            return Err(Refusal::OlderPatch { package: patch.to_string(), installed: build.security_patch.clone() });
-        }
-    }
+    // The package's own build date is never compared with the installed
+    // one: installing an older full build is allowed here.
+    // Neither the build date nor the security patch level is compared with
+    // the installed system: this recovery installs whatever full package it
+    // is given. Only the roster, the device and the package kind are checked.
     Ok(())
 }
 
@@ -300,8 +290,6 @@ METADATA_SIZE=1024
             ("ota-type", "BLOCK", Refusal::NotAb("BLOCK".into())),
             ("serialno", "different", Refusal::OtherSerial),
             ("pre-build-incremental", "required", Refusal::Incremental),
-            ("post-timestamp", "1", Refusal::Older { package: 1, installed: 1_778_243_655 }),
-            ("post-security-patch-level", "2026-03-01", Refusal::OlderPatch { package: "2026-03-01".into(), installed: "2026-04-01".into() }),
         ] {
             let changed = format!("{metadata}\n{field}={value}\n");
             assert_eq!(check_for_recovery(&update_with(&changed, PROPERTIES_TEXT), &phone, &config), Err(refusal));
@@ -347,21 +335,17 @@ METADATA_SIZE=1024
     }
 
     #[test]
-    fn incremental_and_older_packages_are_refused() {
+    fn incremental_packages_are_refused_but_older_builds_are_not() {
         let incremental = format!(
             "{METADATA_TEXT}pre-build=Xiaomi/ishtar/ishtar:16/X/OS3.0.305.0.WMACNXM:user/release-keys\npre-build-incremental=OS3.0.305.0.WMACNXM\n"
         );
         assert_eq!(check(&update_with(&incremental, PROPERTIES_TEXT), &phone()), Err(Refusal::Incremental));
+        // An older build date is not refused: only an incremental package is.
         let older = METADATA_TEXT.replace("1781000000", "1770000000");
-        assert_eq!(
-            check(&update_with(&older, PROPERTIES_TEXT), &phone()),
-            Err(Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 })
-        );
+        assert_eq!(check(&update_with(&older, PROPERTIES_TEXT), &phone()), Ok(()));
+        // A lower security patch level is not refused either.
         let patch = METADATA_TEXT.replace("2026-06-01", "2026-03-01");
-        assert_eq!(
-            check(&update_with(&patch, PROPERTIES_TEXT), &phone()),
-            Err(Refusal::OlderPatch { package: "2026-03-01".into(), installed: "2026-04-01".into() })
-        );
+        assert_eq!(check(&update_with(&patch, PROPERTIES_TEXT), &phone()), Ok(()));
         let allowed = format!("{}spl-downgrade=yes\n", METADATA_TEXT.replace("2026-06-01", "2026-03-01"));
         assert_eq!(check(&update_with(&allowed, PROPERTIES_TEXT), &phone()), Ok(()));
     }

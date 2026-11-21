@@ -22,7 +22,7 @@ $classes=Join-Path $build 'classes'; $dex=Join-Path $build 'dex'; $gen=Join-Path
 New-Item -ItemType Directory -Path $classes,$dex,$gen | Out-Null
 $res=Join-Path $build 'res.zip'; $unsigned=Join-Path $build 'unsigned.apk'; $aligned=Join-Path $build 'aligned.apk'
 Run (Join-Path $bt 'aapt2.exe') @('compile','--dir',(Join-Path $app 'res'),'-o',$res)
-Run (Join-Path $bt 'aapt2.exe') @('link','-o',$unsigned,'-I',$android,'--manifest',(Join-Path $app 'AndroidManifest.xml'),'--java',$gen,'--min-sdk-version','30','--target-sdk-version','35','--version-code','6','--version-name','1.5-Fix50','-A',(Join-Path $build 'assets'),$res)
+Run (Join-Path $bt 'aapt2.exe') @('link','-o',$unsigned,'-I',$android,'--manifest',(Join-Path $app 'AndroidManifest.xml'),'--java',$gen,'--min-sdk-version','30','--target-sdk-version','35','--version-code','7','--version-name','1.8-Fix55','-A',(Join-Path $build 'assets'),$res)
 $sources=@(Get-ChildItem -LiteralPath (Join-Path $app 'java'),(Join-Path $project 'backend\src'),$gen -Recurse -Filter '*.java' -File | ForEach-Object {$_.FullName})
 Run 'javac.exe' (@('-encoding','UTF-8','--release','17','-classpath',$android,'-d',$classes)+$sources)
 $jar=Join-Path $build 'compiled.jar'
@@ -34,7 +34,7 @@ Run (Join-Path $bt 'zipalign.exe') @('-P','16','-f','4',$unsigned,$aligned)
 $keydir=Join-Path $env:LOCALAPPDATA 'SkywardPorter'; New-Item -ItemType Directory -Force -Path $keydir | Out-Null
 $key=Join-Path $keydir 'porter-test.jks'
 if(!(Test-Path -LiteralPath $key)) { Run 'keytool.exe' @('-genkeypair','-keystore',$key,'-storepass','android','-keypass','android','-alias','skyward-porter','-keyalg','RSA','-keysize','2048','-validity','3650','-dname','CN=Skyward Porter Local Test') }
-$apk=Join-Path $build 'Skyward-Porter-Fix50-arm64.apk'
+$apk=Join-Path $build 'Skyward-Porter-arm64.apk'
 $signer=Join-Path $bt 'lib\apksigner.jar'
 Run 'java.exe' @('-jar',$signer,'sign','--ks',$key,'--ks-key-alias','skyward-porter','--ks-pass','pass:android','--key-pass','pass:android','--out',$apk,$aligned)
 Run 'java.exe' @('-jar',$signer,'verify','--verbose','--print-certs',$apk)

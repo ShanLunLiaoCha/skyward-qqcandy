@@ -16,6 +16,9 @@ const PAGE: usize = 4096;
 const MAIN_INIT: &str = "system/etc/init/hw/init.rc";
 const PROGRAM: &str = "system/bin/recovery";
 const MTP_RC: &str = "system/etc/init/skyward-mtp.rc";
+
+/// Replacement images that may be embedded in the image itself.
+pub const REPLACEMENT_ASSETS: [&str; 2] = ["skyward/my_company.img", "skyward/my_preload.img"];
 const ASSETS: [&str; 5] = ["skyward/device.toml", "skyward/MiSansVF.ttf", "skyward/KirkMono-Regular.ttf", "skyward/KirkMono-OFL.txt", MTP_RC];
 
 struct Layout {
@@ -162,9 +165,13 @@ fn repack_with(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])],
     ensure!(!archive.names().any(|name| name == "skyward" || name.starts_with("skyward/") || name == MTP_RC
         || name.starts_with("system/bin/skyward-")), "vendor_boot contains a prior Skyward customization");
     let mut edits = BTreeMap::from([(PROGRAM, recovery.to_vec())]);
-    ensure!(assets.len() == ASSETS.len(), "incomplete native repack assets");
+    // The two replacement images may travel inside the image as well, so a
+    // ported Recovery carries them for an install that needs no extra files.
+    ensure!(assets.len() >= ASSETS.len() && assets.len() <= ASSETS.len() + REPLACEMENT_ASSETS.len(),
+        "incomplete native repack assets");
     for &(name, bytes) in assets {
-        ensure!(ASSETS.contains(&name) && !bytes.is_empty() && bytes.len() <= 32 * 1024 * 1024, "unknown or invalid native repack asset {name}");
+        ensure!((ASSETS.contains(&name) || REPLACEMENT_ASSETS.contains(&name))
+            && !bytes.is_empty() && bytes.len() <= 32 * 1024 * 1024, "unknown or invalid native repack asset {name}");
         ensure!(edits.insert(name, bytes.to_vec()).is_none(), "repeated native repack asset {name}");
     }
     archive.regular(MAIN_INIT)?;

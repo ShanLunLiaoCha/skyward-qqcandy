@@ -123,14 +123,27 @@ mod android {
     fn readiness(slot: &str, number: &str, boot_id: &str) -> Result<()> {
         ensure!(fs::read_to_string(BOOT_ID)?.trim() == boot_id, "device rebooted after preparation");
         ensure!(skyward_sys::prop("ro.boot.slot_suffix").as_deref() == Some(slot), "booted slot changed");
-        ensure!(skyward_sys::prop("ro.boot.vbmeta.device_state").as_deref() == Some("unlocked")
-            && skyward_sys::prop("ro.boot.verifiedbootstate").as_deref() == Some("orange"),
-            "bootloader must explicitly report unlocked/orange");
-        if let Some(value) = skyward_sys::prop("ro.boot.flash.locked") {
-            ensure!(value == "0", "bootloader lock properties disagree");
-        }
-        for (verb, expected) in [("get-current-slot", number), ("get-active-boot-slot", number), ("get-snapshot-merge-status", "none")] {
-            let output = Command::new("/system/bin/bootctl").arg(verb).output()
+        // Some OEM bootloaders publish no ro.boot.vbmeta.device_state at all
+        // and only flash.locked=0 with orange; accept that positive evidence
+        // and reject unknown or conflicting values.
+        let device_state = skyward_sys::prop("ro.boot.vbmeta.device_state").filter(|value| !value.is_empty());
+        let flash_locked = skyward_sys::prop("ro.boot.flash.locked").filter(|value| !value.is_empty());
+        ensure!(skyward_sys::prop("ro.boot.verifiedbootstate").as_deref() == Some("orange")
+            && matches!(device_state.as_deref(), None | Some("unlocked"))
+            && matches!(flash_locked.as_deref(), None | Some("0")),
+            "bootloader must report unlocked/orange (device_state={device_state:?}, flash.locked={flash_locked:?})");
+        // bootctl is absent on some 13.x builds; the snapshot directory is
+        // then the evidence that no merge is pending.
+        let snapshots = fs::read_dir("/metadata/ota/snapshots").map(|dir| dir.count()).unwrap_or(0);
+        ensure!(snapshots == 0, "virtual A/B snapshot state is not idle");
+        let bootctl = Path::new("/system/bin/bootctl");
+        let checks: &[(&str, &str)] = if bootctl.exists() {
+            &[("get-current-slot", number), ("get-active-boot-slot", number), ("get-snapshot-merge-status", "none")]
+        } else {
+            &[]
+        };
+        for (verb, expected) in checks.iter().copied() {
+            let output = Command::new(bootctl).arg(verb).output()
                 .with_context(|| format!("run bootctl {verb}"))?;
             ensure!(output.status.success() && std::str::from_utf8(&output.stdout)?.trim() == expected,
                 "bootctl {verb} does not confirm the current slot and idle snapshots");

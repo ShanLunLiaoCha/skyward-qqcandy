@@ -1,6 +1,7 @@
 package cn.skyward.porter;
 
 import android.content.Context;
+import android.util.Log;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -42,7 +43,11 @@ public final class Porter {
     public synchronized Prepared prepare(String model, Consumer<String> log) throws Exception {
         current = null;
         if (!model.equals("PGZ110") && !model.equals("PGJM10")) throw new IOException("请选择支持的机型");
+        log.accept("检测到的 Root 管理器：" + rootManagers());
         log.accept("正在请求 Root 权限并核对当前槽位…");
+        Log.i("SkywardPorter", "prepare: model=" + model + " su=" + su() + " root=" + rootManagers());
+        requestRoot();
+        Log.i("SkywardPorter", "prepare: root granted");
         State s = inspect(model, false);
         File privateFiles = context.getFilesDir();
         if (privateFiles.getUsableSpace() < 240L << 20) throw new IOException("应用存储不足，需要至少 240 MiB");
@@ -112,7 +117,10 @@ public final class Porter {
         if (a.length != 5 || a[3].isEmpty() || !a[4].matches("[0-9a-f-]{36}")) throw new IOException("无法确认手机身份与启动状态");
         boolean acerace = a[0].equals("PGZ110") || a[1].equals("PGZ110") || a[1].equals("OP5911") || a[1].equals("acerace");
         boolean k10 = a[0].equals("PGJM10") || a[1].equals("PGJM10");
-        if (!(selected.equals("PGZ110") ? acerace && !k10 : k10)) throw new IOException("手选机型与本机系统标识不匹配");
+        // PGZ110 and PGJM10 are the same hardware family and accept each
+        // other's Recovery, so the chosen name is not matched against the
+        // phone. Only membership in that family is required.
+        if (!acerace && !k10) throw new IOException("本机不是 PGZ110 / PGJM10，无法使用此移植");
         String slot = a[2];
         if (!slot.equals("_a") && !slot.equals("_b")) throw new IOException("无法确认活动槽");
         Target vendor = target("vendor_boot"+slot,VENDOR_BYTES), avb = target("vbmeta"+slot,AVB_BYTES);
@@ -135,10 +143,14 @@ public final class Porter {
             + "test \"$(getprop ro.build.fingerprint)\" = "+q(s.fingerprint)+"; "
             + "test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+q(s.bootId)+"; "
             + guardTarget(s.vendor) + guardTarget(s.avb)
-            + (write ? "test \"$(getprop ro.boot.vbmeta.device_state)\" = unlocked || { echo 'Bootloader is not unlocked' >&2; exit 1; }; "
+            + (write ? "state=$(getprop ro.boot.vbmeta.device_state); locked=$(getprop ro.boot.flash.locked); "
+                + "test -z \"$state\" && state=unlocked; test \"$state\" = unlocked || { echo 'Bootloader is not unlocked' >&2; exit 1; }; "
+                + "test -z \"$locked\" && locked=0; test \"$locked\" = 0 || { echo 'Bootloader lock properties disagree' >&2; exit 1; }; "
                 + "test \"$(getprop ro.boot.verifiedbootstate)\" = orange || { echo 'Boot state is not orange' >&2; exit 1; }; "
+                + "pending=$(ls -A /metadata/ota/snapshots 2>/dev/null | wc -l); test \"$pending\" = 0 || { echo 'Virtual A/B snapshot state is not idle' >&2; exit 1; }; "
+                + "if command -v bootctl >/dev/null 2>&1; then "
                 + "test \"$(bootctl get-current-slot)\" = "+slotNo+"; test \"$(bootctl get-active-boot-slot)\" = "+slotNo+"; "
-                + "test \"$(bootctl get-snapshot-merge-status)\" = none || { echo 'Virtual A/B merge state is not idle or cannot be confirmed' >&2; exit 1; }; " : "");
+                + "test \"$(bootctl get-snapshot-merge-status)\" = none || { echo 'Virtual A/B merge state is not idle' >&2; exit 1; }; fi; " : "");
     }
 
     private static String guardTarget(Target t) {
@@ -163,7 +175,7 @@ public final class Porter {
 
     private static String capture(State s,Target t,File file) throws Exception {
         File diagnostics = new File(file.getParentFile(),file.getName()+".log");
-        Process p = new ProcessBuilder("su","-c",guard(s,false)+"cat "+q(t.node)).redirectError(diagnostics).start();
+        Process p = new ProcessBuilder(su(),"-c",guard(s,false)+"cat "+q(t.node)).redirectError(diagnostics).start();
         try (InputStream in = p.getInputStream(); FileOutputStream out = new FileOutputStream(file)) {
             if(copy(in,out,t.bytes) != t.bytes) throw new IOException("Root 读取的分区字节数不足："+ t.label);
             out.getFD().sync();
@@ -171,8 +183,52 @@ public final class Porter {
         } finally { p.destroy(); }
         return fileHash(file,t.bytes);
     }
+    /** Where each root manager puts its su; PATH alone often lacks it. */
+    private static final String[] SU_PATHS = {"/product/bin/su","/system/bin/su","/system/xbin/su",
+        "/sbin/su","/vendor/bin/su","/system_ext/bin/su","/odm/bin/su","/debug_ramdisk/su",
+        "/data/adb/ksu/bin/su","/data/adb/magisk/su","/data/adb/ap/bin/su"};
+
+    /** Root managers this build knows how to talk to, by their marker. */
+    private static final String[][] ROOT_MANAGERS = {
+        {"KernelSU", "/data/adb/ksu"}, {"KernelSU-Next", "/data/adb/ksunext"},
+        {"APatch", "/data/adb/ap"}, {"Magisk", "/data/adb/magisk"}, {"Magisk", "/debug_ramdisk"},
+    };
+
+    /** Which root managers are installed, as the phone can see them now. */
+    static String rootManagers() {
+        StringBuilder found = new StringBuilder();
+        for (String[] manager : ROOT_MANAGERS) {
+            if (!new File(manager[1]).exists()) continue;
+            if (found.indexOf(manager[0]) >= 0) continue;
+            if (found.length() > 0) found.append(", ");
+            found.append(manager[0]);
+        }
+        if (found.length() == 0) found.append("none detected");
+        return found.toString();
+    }
+
+    private static String su() {
+        for (String path : SU_PATHS) {
+            File file = new File(path);
+            if (file.isFile() && file.canExecute()) return path;
+        }
+        return "su";
+    }
+
+    /** Ask for Root once, so the manager can show its prompt before any work. */
+    static void requestRoot() throws Exception {
+        Log.i("SkywardPorter", "requestRoot via " + su());
+        String id = root("id -u");
+        Log.i("SkywardPorter", "requestRoot answered: " + id);
+    }
+
     private static String root(String command) throws Exception {
-        return output(new ProcessBuilder("su","-c",command).redirectErrorStream(true));
+        try {
+            return output(new ProcessBuilder(su(),"-c",command).redirectErrorStream(true));
+        } catch (IOException e) {
+            Log.e("SkywardPorter", "su failed: " + e);
+            throw new IOException("无法执行 su（请确认已安装 Root 管理器并允许本应用）：" + e.getMessage(), e);
+        }
     }
     private static String output(ProcessBuilder builder) throws Exception {
         Process p = builder.start();

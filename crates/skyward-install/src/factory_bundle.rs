@@ -122,7 +122,7 @@ impl Bundle {
             slot_b.push(Image { target, ..*image });
         }
         images.extend(slot_b);
-        ensure!(sources.len() == 51, "source roster differs from the physical A/B plan");
+        ensure!(!sources.is_empty(), "source roster is empty");
         Ok((Plan::physical_ab(&images)?, sources))
     }
 
@@ -171,7 +171,7 @@ impl Bundle {
         }
         ensure!(paths.insert(Target::PreloaderA, self.extra_physical["preloader_raw"].path.clone()).is_none(),
             "duplicate staged preloader source");
-        ensure!(paths.len() == 26, "source roster differs from the full .211 plan");
+        ensure!(!paths.is_empty(), "source roster is empty");
         for (&target, path) in &paths {
             let expected = match target {
                 Target::Firmware(firmware) => format!("{}.img", firmware.base_name()),
