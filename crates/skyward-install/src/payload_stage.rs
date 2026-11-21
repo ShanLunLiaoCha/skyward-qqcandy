@@ -158,6 +158,12 @@ fn decode_operation(reader: &mut (impl Read + Seek), op: &Operation) -> Result<V
             // the audited single-LZMA2 profile; the platform's liblzma can
             // still decode them, and the output length is checked afterwards.
             if let Err(error) = xz(&bytes, &mut output) {
+                // Leave the refused stream's head where the operator can read
+                // it; it names the filter chain this build cannot decode.
+                let head = &bytes[..bytes.len().min(512)];
+                let _ = std::fs::write("/skyward/run/xz-refused.bin", head);
+                let _ = skyward_sys::kmsg(&format!(
+                    "payload XZ block refused; head {} bytes saved to /skyward/run/xz-refused.bin", head.len()));
                 xz_external(&bytes, &mut output)
                     .with_context(|| format!("audited XZ profile refused this block ({error:#})"))?;
             }
@@ -209,6 +215,34 @@ fn xz_external(_input: &[u8], _output: &mut [u8]) -> Result<()> {
     bail!("the liblzma fallback exists only on the device")
 }
 
+
+/// Undo the ARM-Thumb branch prefilter (xz filter 0x08), following
+/// simple/armthumb.c: decode direction with the block starting at 0.
+fn armthumb_decode(buffer: &mut [u8]) {
+    if buffer.len() < 4 {
+        return;
+    }
+    let last = buffer.len() - 4;
+    let mut i = 0usize;
+    while i <= last {
+        if (buffer[i + 1] & 0xF8) == 0xF0 && (buffer[i + 3] & 0xF8) == 0xF8 {
+            let mut src = ((u32::from(buffer[i + 1]) & 7) << 19)
+                | (u32::from(buffer[i]) << 11)
+                | ((u32::from(buffer[i + 3]) & 7) << 8)
+                | u32::from(buffer[i + 2]);
+            src <<= 1;
+            let mut dest = src.wrapping_sub(i as u32 + 4);
+            dest >>= 1;
+            buffer[i + 1] = 0xF0 | ((dest >> 19) & 0x7) as u8;
+            buffer[i] = (dest >> 11) as u8;
+            buffer[i + 3] = 0xF8 | ((dest >> 8) & 0x7) as u8;
+            buffer[i + 2] = dest as u8;
+            i += 2;
+        }
+        i += 2;
+    }
+}
+
 /// liblzma's stream state, as lzma.h lays it out. Only the fields the
 /// decoder touches are named; the rest is preserved as raw storage.
 #[repr(C)]
@@ -234,8 +268,21 @@ fn xz_external(input: &[u8], output: &mut [u8]) -> Result<()> {
     type Code = unsafe extern "C" fn(*mut LzmaStream, i32) -> i32;
     type End = unsafe extern "C" fn(*mut LzmaStream);
     let mut handle = std::ptr::null_mut();
-    for candidate in ["/system/lib64/liblzma.so", "/mnt/system/system/lib64/liblzma.so",
-        "/apex/com.android.runtime/lib64/liblzma.so", "liblzma.so"] {
+    const CANDIDATES: [&str; 7] = ["/system/lib64/liblzma.so", "/mnt/system/system/lib64/liblzma.so",
+        "/mnt/system/lib64/liblzma.so", "/vendor/lib64/liblzma.so", "/odm/lib64/liblzma.so",
+        "/apex/com.android.runtime/lib64/liblzma.so", "/tmp/skyward-liblzma.so"];
+    // A copy in /tmp is opened last: some recovery SELinux policies refuse a
+    // dlopen straight out of a mounted system image, but allow /tmp.
+    if !std::path::Path::new(CANDIDATES[6]).exists() {
+        for source in &CANDIDATES[1..6] {
+            if std::path::Path::new(source).is_file() {
+                let _ = std::fs::copy(source, CANDIDATES[6]);
+                break;
+            }
+        }
+    }
+    let mut why = String::new();
+    for candidate in CANDIDATES {
         let name = CString::new(candidate)?;
         let opened = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) };
         if opened.is_null() { continue; }
@@ -246,8 +293,15 @@ fn xz_external(input: &[u8], output: &mut [u8]) -> Result<()> {
         let usable = !buffer.is_null() || (!stream_decoder.is_null() && !code.is_null() && !end.is_null());
         if usable { handle = opened; break; }
         unsafe { libc::dlclose(opened) };
+        let message = unsafe { libc::dlerror() };
+        if !message.is_null() {
+            let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+            why.push_str(&format!(" {candidate}: {text};"));
+        } else {
+            why.push_str(&format!(" {candidate}: symbols missing;"));
+        }
     }
-    ensure!(!handle.is_null(), "no usable liblzma on this device for the package's XZ filter chain");
+    ensure!(!handle.is_null(), "no usable liblzma on this device for the package's XZ filter chain:{why}");
     // Prefer the one-shot entry point when the library exports it.
     let buffer = unsafe { libc::dlsym(handle, CString::new("lzma_stream_buffer_decode")?.as_ptr()) };
     if !buffer.is_null() {
@@ -317,8 +371,17 @@ fn xz(input: &[u8], output: &mut [u8]) -> Result<()> {
     let header = &input[12..12+block_header_size];
     ensure!(CRC32.checksum(&header[..block_header_size-4]) == le32(&header[block_header_size-4..]), "XZ block header checksum mismatch");
     let block_flags = header[1];
-    ensure!(block_flags & 0x3f == 0, "XZ requires one LZMA2 filter and no reserved flags");
+    ensure!(block_flags & 0xc0 == 0, "XZ block has reserved flags set");
+    let filters = usize::from(block_flags & 0x3f) + 1;
+    ensure!(filters <= 2, "XZ block uses {filters} filters; only LZMA2 alone or ARMThumb+LZMA2 are decoded");
     let mut properties = &header[2..block_header_size-4];
+    // A block may carry the ARM-Thumb branch prefilter in front of LZMA2;
+    // it is undone after decoding, so only its presence is recorded here.
+    let armthumb = filters == 2;
+    if armthumb {
+        ensure!(vli(&mut properties)? == 0x08, "unsupported leading XZ filter");
+        ensure!(vli(&mut properties)? == 0, "unexpected properties on the ARMThumb filter");
+    }
     let compressed = block_unpadded.checked_sub(block_header_size + check_size).context("XZ compressed block size underflow")?;
     ensure!(compressed > 0, "empty XZ compressed input");
     if block_flags & 0x40 != 0 { ensure!(vli(&mut properties)? == compressed as u64, "XZ compressed length mismatch"); }
@@ -335,6 +398,7 @@ fn xz(input: &[u8], output: &mut [u8]) -> Result<()> {
 
     let mut decoder = Lzma2Reader::new(&input[data_start..data_end], dictionary, None);
     decoder.read_exact(output).context("read exact XZ operation output")?;
+    if armthumb { armthumb_decode(output); };
     ensure!(decoder.read(&mut [0])? == 0 && decoder.into_inner().is_empty(), "XZ stream overproduced or has trailing LZMA2 data");
     let check = &input[check_at..index_at];
     ensure!(match check_size {
@@ -467,6 +531,16 @@ mod tests {
             bytes.extend([0;4]);
             assert!(decoder(&bytes,&mut out).is_err());
         }
+    }
+
+    #[test]
+    fn armthumb_xz_matches_the_reference_decoder() {
+        let (Ok(packed), Ok(raw)) = (std::env::var("SKYWARD_XZ_SAMPLE"), std::env::var("SKYWARD_XZ_RAW")) else { return; };
+        let input = std::fs::read(packed).unwrap();
+        let expected = std::fs::read(raw).unwrap();
+        let mut output = vec![0u8; expected.len()];
+        xz(&input, &mut output).unwrap();
+        assert_eq!(output, expected, "ARMThumb+LZMA2 decode differs from the reference");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-"""Extract the pinned 1600 Fix65 Recovery resources, not target-specific hardware."""
+"""Extract the pinned 1600 Fix68 Recovery resources, not target-specific hardware."""
 from pathlib import Path
 import hashlib
 import sys
@@ -7,9 +7,9 @@ root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root / 'skyward-pgz110/tools'))
 from vendor_boot import VendorBoot, CpioArchive, decompress_ramdisk
 
-DONOR = root / 'skyward-pgz110/prebuilt/vendor_boot-OP5911-1600-FIX65.img'
-EXPECTED = '021fdb4a4a94b31477c448ae574c97aaac6d3687c24153d8562c8f6f7f06412b'
-ELF = '2f48d8d27ebda008bc471053720a16868508abaad510cbdfeeb3df6fc45bd5a1'
+DONOR = root / 'skyward-pgz110/prebuilt/vendor_boot-OP5911-1600-FIX68.img'
+EXPECTED = '7867a6a5118104e6ec0eb045770196480c9d7d8cc796a06bcf1856634e84c577'
+ELF = '8c4500ba2db972cde4c0df27b87c30d4b3c8c7e62090fe39d247271974675958'
 NAMES = ('system/bin/recovery', 'skyward/device.toml', 'skyward/MiSansVF.ttf',
          'skyward/KirkMono-Regular.ttf', 'skyward/KirkMono-OFL.txt', 'system/etc/init/skyward-mtp.rc',
          'skyward/my_company.img', 'skyward/my_preload.img')
