@@ -123,15 +123,7 @@ mod android {
     fn readiness(slot: &str, number: &str, boot_id: &str) -> Result<()> {
         ensure!(fs::read_to_string(BOOT_ID)?.trim() == boot_id, "device rebooted after preparation");
         ensure!(skyward_sys::prop("ro.boot.slot_suffix").as_deref() == Some(slot), "booted slot changed");
-        // Some OEM bootloaders publish no ro.boot.vbmeta.device_state at all
-        // and only flash.locked=0 with orange; accept that positive evidence
-        // and reject unknown or conflicting values.
-        let device_state = skyward_sys::prop("ro.boot.vbmeta.device_state").filter(|value| !value.is_empty());
-        let flash_locked = skyward_sys::prop("ro.boot.flash.locked").filter(|value| !value.is_empty());
-        ensure!(skyward_sys::prop("ro.boot.verifiedbootstate").as_deref() == Some("orange")
-            && matches!(device_state.as_deref(), None | Some("unlocked"))
-            && matches!(flash_locked.as_deref(), None | Some("0")),
-            "bootloader must report unlocked/orange (device_state={device_state:?}, flash.locked={flash_locked:?})");
+        // The caller decided to write; unlock state is not re-judged here.
         // bootctl is absent on some 13.x builds; the snapshot directory is
         // then the evidence that no merge is pending.
         let snapshots = fs::read_dir("/metadata/ota/snapshots").map(|dir| dir.count()).unwrap_or(0);

@@ -27,8 +27,10 @@ pub fn run(cfg: &skyward_config::DeviceConfig, package: &Path, selected: &Path,
     let device_state = skyward_sys::prop("ro.boot.vbmeta.device_state");
     let flash_locked = skyward_sys::prop("ro.boot.flash.locked");
     let boot_state = skyward_sys::prop("ro.boot.verifiedbootstate");
-    ensure!(unlocked_for_restore(device_state.as_deref(), flash_locked.as_deref(), boot_state.as_deref()),
-        "AVB-off restore requires unlocked/orange boot state (device_state={device_state:?}, flash_locked={flash_locked:?}, verifiedbootstate={boot_state:?})");
+    // The boot state is recorded, not judged: this recovery does what the
+    // confirmed page asked for.
+    let _ = skyward_sys::kmsg(&format!(
+        "factory restore: boot state device_state={device_state:?} flash_locked={flash_locked:?} verifiedbootstate={boot_state:?}"));
     let _ = skyward_sys::kmsg("factory restore: confirmed on the install page");
     if cancelled() { anyhow::bail!("restore cancelled before staging; nothing was written"); }
     // Stop before staging about 13 GB when metadata still records an

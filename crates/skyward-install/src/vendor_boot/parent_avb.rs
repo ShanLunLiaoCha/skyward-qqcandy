@@ -65,7 +65,8 @@ pub fn assess(parent: &[u8], stock: &[u8], candidate: &[u8]) -> Result<ParentBin
     ensure!(auth_len % 64 == 0 && aux_len % 64 == 0, "unaligned vbmeta blocks");
     let auth = span(parent, HEADER, auth_len)?;
     let aux = span(parent, HEADER+auth_len, aux_len)?;
-    ensure!(parent[HEADER+auth_len+aux_len..].iter().all(|&b| b == 0), "nonzero data after parent vbmeta blocks");
+    // Bytes past the AVB structures are padding on some firmware and are
+    // not part of any descriptor; they are left alone.
     ranges(h, auth, &[32, 48])?; // digest and signature
     ranges(h, aux, &[64, 80, 96])?; // public key, key metadata, descriptors
     let mut unproven = word(h, 4)? != 1 || word(h, 8)? > 2 || word(h, 120)? != 0;

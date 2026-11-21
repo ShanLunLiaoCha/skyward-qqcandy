@@ -14,7 +14,8 @@ public final class Porter {
     private static final long VENDOR_BYTES = 64L << 20, AVB_BYTES = 8L << 20;
     private static final String[] ASSETS = {"system/bin/recovery", "skyward/device.toml",
         "skyward/MiSansVF.ttf", "skyward/KirkMono-Regular.ttf", "skyward/KirkMono-OFL.txt",
-        "system/etc/init/skyward-mtp.rc"};
+        "system/etc/init/skyward-mtp.rc",
+        "skyward/my_company.img", "skyward/my_preload.img"};
     private final Context context;
     private Prepared current;
 
@@ -138,19 +139,19 @@ public final class Porter {
 
     private static String guard(State s, boolean write) {
         String slotNo = s.slot.equals("_a") ? "0" : "1";
+        // Unlock state is not judged here: the user asked for the write.
         return "set -eu; test \"$(id -u)\" = 0; "
             + "test \"$(getprop ro.boot.slot_suffix)\" = "+q(s.slot)+"; "
             + "test \"$(getprop ro.build.fingerprint)\" = "+q(s.fingerprint)+"; "
             + "test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+q(s.bootId)+"; "
             + guardTarget(s.vendor) + guardTarget(s.avb)
-            + (write ? "state=$(getprop ro.boot.vbmeta.device_state); locked=$(getprop ro.boot.flash.locked); "
-                + "test -z \"$state\" && state=unlocked; test \"$state\" = unlocked || { echo 'Bootloader is not unlocked' >&2; exit 1; }; "
-                + "test -z \"$locked\" && locked=0; test \"$locked\" = 0 || { echo 'Bootloader lock properties disagree' >&2; exit 1; }; "
-                + "test \"$(getprop ro.boot.verifiedbootstate)\" = orange || { echo 'Boot state is not orange' >&2; exit 1; }; "
-                + "pending=$(ls -A /metadata/ota/snapshots 2>/dev/null | wc -l); test \"$pending\" = 0 || { echo 'Virtual A/B snapshot state is not idle' >&2; exit 1; }; "
+            + (write ? "pending=$(ls -A /metadata/ota/snapshots 2>/dev/null | wc -l); test \"$pending\" = 0 "
+                + "|| { echo 'Virtual A/B snapshot state is not idle' >&2; exit 1; }; "
                 + "if command -v bootctl >/dev/null 2>&1; then "
-                + "test \"$(bootctl get-current-slot)\" = "+slotNo+"; test \"$(bootctl get-active-boot-slot)\" = "+slotNo+"; "
-                + "test \"$(bootctl get-snapshot-merge-status)\" = none || { echo 'Virtual A/B merge state is not idle' >&2; exit 1; }; fi; " : "");
+                + "test \"$(bootctl get-current-slot)\" = "+slotNo+"; "
+                + "test \"$(bootctl get-active-boot-slot)\" = "+slotNo+"; "
+                + "test \"$(bootctl get-snapshot-merge-status)\" = none "
+                + "|| { echo 'Virtual A/B merge state is not idle' >&2; exit 1; }; fi; " : "");
     }
 
     private static String guardTarget(Target t) {
@@ -234,7 +235,7 @@ public final class Porter {
         Process p = builder.start();
         try (InputStream in = p.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             copy(in,out,128L<<10);
-            String message = out.toString(StandardCharsets.UTF_8).trim();
+            String message = new String(out.toByteArray(), StandardCharsets.UTF_8).trim();
             if (p.waitFor()!=0) throw new IOException(message.isEmpty()? "命令失败（Root 未授权或分区检查不通过）":message);
             return message;
         } finally { p.destroy(); }

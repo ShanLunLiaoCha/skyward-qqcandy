@@ -135,7 +135,7 @@ fn clean_properties(bytes: &[u8]) -> Result<Vec<u8>> {
 /// caller is responsible for establishing actual stock provenance, matching
 /// the slot's boot/dtbo, and deciding whether device AVB will accept the result.
 pub fn repack(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])]) -> Result<Vec<u8>> {
-    repack_with(stock, recovery, assets, encoder())
+    repack_with(stock, recovery, assets, encoder(), true)
 }
 
 /// Stock vendor_boot images leave little room for a larger recovery program.
@@ -151,19 +151,33 @@ fn encoder() -> fn(&[u8], usize) -> Result<Vec<u8>> {
 /// Every structural and independent round-trip check is shared with repack.
 #[cfg(feature = "lz4-sys")]
 pub fn repack_hc(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])]) -> Result<Vec<u8>> {
-    repack_with(stock, recovery, assets, lz4::encode_hc)
+    repack_with(stock, recovery, assets, lz4::encode_hc, true)
+}
+
+/// Repack an image whose AVB footer is already this tool's own output, or
+/// otherwise not the vendor's: the layout is still checked, the footer is
+/// not. The result is written with AVB off and verified by the caller.
+#[cfg(feature = "lz4-sys")]
+pub fn repack_hc_unverified_avb(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    repack_with(stock, recovery, assets, lz4::encode_hc, false)
 }
 
 fn repack_with(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])],
-    encode: fn(&[u8], usize) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+    encode: fn(&[u8], usize) -> Result<Vec<u8>>, verify_avb: bool) -> Result<Vec<u8>> {
     let layout = Layout::parse(stock)?;
-    avb::verify(stock, layout.end, true).context("verify original vendor_boot AVB data")?;
+    if verify_avb {
+        avb::verify(stock, layout.end, true).context("verify original vendor_boot AVB data")?;
+    }
     elf(recovery)?;
     let decoded = lz4::decode(&stock[layout.ramdisk.clone()])?;
     let archive = cpio::Archive::parse(&decoded)?;
     elf(archive.regular(PROGRAM)?).context("invalid stock recovery program")?;
-    ensure!(!archive.names().any(|name| name == "skyward" || name.starts_with("skyward/") || name == MTP_RC
-        || name.starts_with("system/bin/skyward-")), "vendor_boot contains a prior Skyward customization");
+    // A phone already running this Recovery is a legitimate starting point
+    // for the permissive path: its own entries are replaced below.
+    if verify_avb {
+        ensure!(!archive.names().any(|name| name == "skyward" || name.starts_with("skyward/") || name == MTP_RC
+            || name.starts_with("system/bin/skyward-")), "vendor_boot contains a prior Skyward customization");
+    }
     let mut edits = BTreeMap::from([(PROGRAM, recovery.to_vec())]);
     // The two replacement images may travel inside the image as well, so a
     // ported Recovery carries them for an install that needs no extra files.

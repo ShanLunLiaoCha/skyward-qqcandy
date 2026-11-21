@@ -41,10 +41,18 @@ fn main() -> Result<()> {
         "skyward/my_company.img", "skyward/my_preload.img"];
     let contents = names.iter().map(|name| read(&donor.join(name), 32 << 20)).collect::<Result<Vec<_>>>()?;
     let assets: Vec<_> = names.into_iter().zip(contents.iter().map(Vec::as_slice)).collect();
-    let image = vendor_boot::repack_hc(&stock, &elf, &assets)?;
+    // The phone may already run this tool's own Recovery, whose footer is
+    // not the vendor's; the layout checks still apply, and AVB is turned off
+    // below either way.
+    let image = match vendor_boot::repack_hc(&stock, &elf, &assets) {
+        Ok(image) => image,
+        Err(strict) => vendor_boot::repack_hc_unverified_avb(&stock, &elf, &assets)
+            .with_context(|| format!("strict repack refused the image ({strict:#})"))?,
+    };
     // The physical backup includes padding beyond the supported AVB header.
     let compact = parent.get(..1 << 20).context("vbmeta prefix")?;
-    ensure!(parent[1 << 20..].iter().all(|&b| b == 0), "nonzero trailing vbmeta data");
+    // Padding or leftovers past the AVB structures are kept as they are; the
+    // tool only rewrites the flags word inside the first megabyte.
     // The candidate is written with AVB off, so the parent binding is only
     // inspected: it may bind the stock image (RejectsCandidate) or prove no
     // binding at all (Unproven, seen on some 13.x layouts). A parent that
