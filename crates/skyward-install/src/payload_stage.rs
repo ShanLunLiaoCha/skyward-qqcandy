@@ -209,33 +209,82 @@ fn xz_external(_input: &[u8], _output: &mut [u8]) -> Result<()> {
     bail!("the liblzma fallback exists only on the device")
 }
 
+/// liblzma's stream state, as lzma.h lays it out. Only the fields the
+/// decoder touches are named; the rest is preserved as raw storage.
+#[repr(C)]
+#[derive(Default)]
+struct LzmaStream {
+    next_in: *const u8, avail_in: usize, total_in: u64,
+    next_out: *mut u8, avail_out: usize, total_out: u64,
+    allocator: *const std::ffi::c_void, internal: *mut std::ffi::c_void,
+    reserved_ptr1: *mut std::ffi::c_void, reserved_ptr2: *mut std::ffi::c_void,
+    reserved_ptr3: *mut std::ffi::c_void, reserved_ptr4: *mut std::ffi::c_void,
+    reserved_int1: u64, reserved_int2: u64, seek_pos: u64, reserved_int3: u64,
+    reserved_int4: u64, reserved_enum1: i32, reserved_enum2: i32,
+}
+
 /// Decode an XZ stream with the platform's liblzma, for blocks the audited
-/// single-filter profile refuses. Only the length contract is enforced here.
+/// single-filter profile refuses (packages carrying a BCJ/Delta prefilter).
+/// Only the length contract is enforced here; the block digest was verified
+/// by the caller before this point.
 #[cfg(target_os = "android")]
 fn xz_external(input: &[u8], output: &mut [u8]) -> Result<()> {
-    use std::ffi::{c_void, CStr, CString};
-    type Decode = unsafe extern "C" fn(*mut u64, u32, *const c_void, *const u8, *mut usize, usize,
-        *mut u8, *mut usize, usize) -> i32;
+    use std::ffi::{c_void, CString};
+    type DecoderInit = unsafe extern "C" fn(*mut LzmaStream, u64, u32) -> i32;
+    type Code = unsafe extern "C" fn(*mut LzmaStream, i32) -> i32;
+    type End = unsafe extern "C" fn(*mut LzmaStream);
     let mut handle = std::ptr::null_mut();
     for candidate in ["/system/lib64/liblzma.so", "/mnt/system/system/lib64/liblzma.so",
         "/apex/com.android.runtime/lib64/liblzma.so", "liblzma.so"] {
         let name = CString::new(candidate)?;
         let opened = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) };
-        if !opened.is_null() { handle = opened; break; }
+        if opened.is_null() { continue; }
+        let buffer = unsafe { libc::dlsym(opened, CString::new("lzma_stream_buffer_decode")?.as_ptr()) };
+        let stream_decoder = unsafe { libc::dlsym(opened, CString::new("lzma_stream_decoder")?.as_ptr()) };
+        let code = unsafe { libc::dlsym(opened, CString::new("lzma_code")?.as_ptr()) };
+        let end = unsafe { libc::dlsym(opened, CString::new("lzma_end")?.as_ptr()) };
+        let usable = !buffer.is_null() || (!stream_decoder.is_null() && !code.is_null() && !end.is_null());
+        if usable { handle = opened; break; }
+        unsafe { libc::dlclose(opened) };
     }
-    ensure!(!handle.is_null(), "no liblzma on this device for the package's XZ filter chain");
-    let symbol = CString::new("lzma_stream_buffer_decode")?;
-    let pointer = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
-    ensure!(!pointer.is_null(), "liblzma has no lzma_stream_buffer_decode");
-    let decode: Decode = unsafe { std::mem::transmute(pointer) };
-    let (mut memlimit, mut in_pos, mut out_pos) = (u64::MAX, 0usize, 0usize);
-    let ret = unsafe { decode(&mut memlimit, 0, std::ptr::null(), input.as_ptr(), &mut in_pos, input.len(),
-        output.as_mut_ptr(), &mut out_pos, output.len()) };
+    ensure!(!handle.is_null(), "no usable liblzma on this device for the package's XZ filter chain");
+    // Prefer the one-shot entry point when the library exports it.
+    let buffer = unsafe { libc::dlsym(handle, CString::new("lzma_stream_buffer_decode")?.as_ptr()) };
+    if !buffer.is_null() {
+        type BufferDecode = unsafe extern "C" fn(*mut u64, u32, *const c_void, *const u8, *mut usize, usize,
+            *mut u8, *mut usize, usize) -> i32;
+        let decode: BufferDecode = unsafe { std::mem::transmute(buffer) };
+        let (mut memlimit, mut in_pos, mut out_pos) = (u64::MAX, 0usize, 0usize);
+        let ret = unsafe { decode(&mut memlimit, 0, std::ptr::null(), input.as_ptr(), &mut in_pos, input.len(),
+            output.as_mut_ptr(), &mut out_pos, output.len()) };
+        unsafe { libc::dlclose(handle) };
+        ensure!(ret == 0 && in_pos == input.len() && out_pos == output.len(),
+            "liblzma refused this XZ block (state {ret}, read {in_pos}/{}, wrote {out_pos}/{})",
+            input.len(), output.len());
+        return Ok(());
+    }
+    let init: DecoderInit = unsafe { std::mem::transmute(libc::dlsym(handle, CString::new("lzma_stream_decoder")?.as_ptr())) };
+    let code: Code = unsafe { std::mem::transmute(libc::dlsym(handle, CString::new("lzma_code")?.as_ptr())) };
+    let end: End = unsafe { std::mem::transmute(libc::dlsym(handle, CString::new("lzma_end")?.as_ptr())) };
+    let mut stream = LzmaStream::default();
+    const LZMA_OK: i32 = 0;
+    const LZMA_STREAM_END: i32 = 1;
+    const LZMA_RUN: i32 = 0;
+    ensure!(unsafe { init(&mut stream, u64::MAX, 0) } == LZMA_OK, "liblzma stream decoder init failed");
+    stream.next_in = input.as_ptr();
+    stream.avail_in = input.len();
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = output.len();
+    let mut result = LZMA_OK;
+    while result == LZMA_OK && stream.avail_out != 0 {
+        result = unsafe { code(&mut stream, LZMA_RUN) };
+    }
+    let (produced, consumed) = (stream.total_out, stream.total_in);
+    unsafe { end(&mut stream) };
     unsafe { libc::dlclose(handle) };
-    ensure!(ret == 0 && in_pos == input.len() && out_pos == output.len(),
-        "liblzma could not decode this XZ block (ret {ret}, read {in_pos}/{}, wrote {out_pos}/{})",
-        input.len(), output.len());
-    let _ = CStr::from_bytes_with_nul(b"\0");
+    ensure!(result == LZMA_STREAM_END && produced == output.len() as u64 && consumed == input.len() as u64,
+        "liblzma decoded {produced}/{} bytes from {consumed}/{} (state {result})",
+        output.len(), input.len());
     Ok(())
 }
 
