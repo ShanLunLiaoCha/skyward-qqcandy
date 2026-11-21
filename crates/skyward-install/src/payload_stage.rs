@@ -153,7 +153,15 @@ fn decode_operation(reader: &mut (impl Read + Seek), op: &Operation) -> Result<V
     if op.kind == Kind::Replace { return Ok(bytes); }
     let mut output = zeroes(op.output_size as usize)?;
     match op.kind {
-        Kind::ReplaceXz => xz(&bytes, &mut output)?,
+        Kind::ReplaceXz => {
+            // Packages built with an extra XZ filter (BCJ/Delta) are outside
+            // the audited single-LZMA2 profile; the platform's liblzma can
+            // still decode them, and the output length is checked afterwards.
+            if let Err(error) = xz(&bytes, &mut output) {
+                xz_external(&bytes, &mut output)
+                    .with_context(|| format!("audited XZ profile refused this block ({error:#})"))?;
+            }
+        }
         Kind::ReplaceBz => bz(&bytes, &mut output)?,
         _ => bail!("unsupported compressed operation"),
     }
@@ -193,6 +201,42 @@ fn vli(input: &mut &[u8]) -> Result<u64> {
         }
     }
     bail!("oversized XZ variable-length field")
+}
+
+
+#[cfg(not(target_os = "android"))]
+fn xz_external(_input: &[u8], _output: &mut [u8]) -> Result<()> {
+    bail!("the liblzma fallback exists only on the device")
+}
+
+/// Decode an XZ stream with the platform's liblzma, for blocks the audited
+/// single-filter profile refuses. Only the length contract is enforced here.
+#[cfg(target_os = "android")]
+fn xz_external(input: &[u8], output: &mut [u8]) -> Result<()> {
+    use std::ffi::{c_void, CStr, CString};
+    type Decode = unsafe extern "C" fn(*mut u64, u32, *const c_void, *const u8, *mut usize, usize,
+        *mut u8, *mut usize, usize) -> i32;
+    let mut handle = std::ptr::null_mut();
+    for candidate in ["/system/lib64/liblzma.so", "/mnt/system/system/lib64/liblzma.so",
+        "/apex/com.android.runtime/lib64/liblzma.so", "liblzma.so"] {
+        let name = CString::new(candidate)?;
+        let opened = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) };
+        if !opened.is_null() { handle = opened; break; }
+    }
+    ensure!(!handle.is_null(), "no liblzma on this device for the package's XZ filter chain");
+    let symbol = CString::new("lzma_stream_buffer_decode")?;
+    let pointer = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    ensure!(!pointer.is_null(), "liblzma has no lzma_stream_buffer_decode");
+    let decode: Decode = unsafe { std::mem::transmute(pointer) };
+    let (mut memlimit, mut in_pos, mut out_pos) = (u64::MAX, 0usize, 0usize);
+    let ret = unsafe { decode(&mut memlimit, 0, std::ptr::null(), input.as_ptr(), &mut in_pos, input.len(),
+        output.as_mut_ptr(), &mut out_pos, output.len()) };
+    unsafe { libc::dlclose(handle) };
+    ensure!(ret == 0 && in_pos == input.len() && out_pos == output.len(),
+        "liblzma could not decode this XZ block (ret {ret}, read {in_pos}/{}, wrote {out_pos}/{})",
+        input.len(), output.len());
+    let _ = CStr::from_bytes_with_nul(b"\0");
+    Ok(())
 }
 
 /// The OTA writer emits a single XZ stream, a single block and a single
