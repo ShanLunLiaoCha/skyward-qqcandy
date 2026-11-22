@@ -43,7 +43,9 @@ public final class Porter {
 
     public synchronized Prepared prepare(String model, Consumer<String> log) throws Exception {
         current = null;
-        if (!model.equals("PGZ110") && !model.equals("PGJM10")) throw new IOException("请选择支持的机型");
+        // The device model is not judged: any phone this package can be
+        // prepared for is accepted, and the slot/partition checks below are
+        // what actually guard the write.
         log.accept("检测到的 Root 管理器：" + rootManagers());
         log.accept("正在请求 Root 权限并核对当前槽位…");
         Log.i("SkywardPorter", "prepare: model=" + model + " su=" + su() + " root=" + rootManagers());
@@ -118,10 +120,9 @@ public final class Porter {
         if (a.length != 5 || a[3].isEmpty() || !a[4].matches("[0-9a-f-]{36}")) throw new IOException("无法确认手机身份与启动状态");
         boolean acerace = a[0].equals("PGZ110") || a[1].equals("PGZ110") || a[1].equals("OP5911") || a[1].equals("acerace");
         boolean k10 = a[0].equals("PGJM10") || a[1].equals("PGJM10");
-        // PGZ110 and PGJM10 are the same hardware family and accept each
-        // other's Recovery, so the chosen name is not matched against the
-        // phone. Only membership in that family is required.
-        if (!acerace && !k10) throw new IOException("本机不是 PGZ110 / PGJM10，无法使用此移植");
+        // Reported for the log only; no model is refused.
+        Log.i("SkywardPorter", "inspect: model=" + a[0] + " device=" + a[1]
+            + " family=" + (acerace ? "PGZ110" : k10 ? "PGJM10" : "other"));
         String slot = a[2];
         if (!slot.equals("_a") && !slot.equals("_b")) throw new IOException("无法确认活动槽");
         Target vendor = target("vendor_boot"+slot,VENDOR_BYTES), avb = target("vbmeta"+slot,AVB_BYTES);

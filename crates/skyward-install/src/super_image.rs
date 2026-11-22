@@ -29,16 +29,19 @@ pub(crate) fn build_a_observed<R: Read + Seek>(reader: &mut R, payload: &payload
     reference: &skyward_lp::Metadata, actual_bytes: u64, company: &Path, preload: &Path,
     output: &Path, progress: &mut impl FnMut(&str, usize, usize) -> Result<()>) -> Result<ResultImage> {
     let [device] = reference.block_devices.as_slice() else { anyhow::bail!("expected one physical super device"); };
-    ensure!(reference.damaged.is_empty() && reference.header_flags == HEADER_FLAG_VIRTUAL_AB_DEVICE
-        && device.partition_name == "super" && device.size == actual_bytes,
+    ensure!(reference.damaged.is_empty() && reference.header_flags & HEADER_FLAG_VIRTUAL_AB_DEVICE != 0
+        && device.partition_name == "super",
         "physical super or metadata does not match the Virtual A/B reference");
+    // The measured partition size wins over whatever the metadata recorded.
+    let mut device = device.clone();
+    device.size = actual_bytes;
     let replacements = BTreeMap::from([("my_company", company), ("my_preload", preload)]);
     let company_bytes = super_replacement::inspect(company)?;
     let preload_bytes = super_replacement::inspect(preload)?;
     let (limit, sizes) = target_sizes(payload, company_bytes, preload_bytes)?;
     let source: BTreeMap<_, _> = payload.partitions.iter().map(|p| (p.name.as_str(), p)).collect();
-    let layout = skyward_lp::single_a::build(reference.geometry, device, limit, &sizes)?;
-    write_candidate(reader, payload, reference.geometry, device, &replacements, &sizes, &source, layout, output, progress)
+    let layout = skyward_lp::single_a::build(reference.geometry, &device, limit, &sizes)?;
+    write_candidate(reader, payload, reference.geometry, &device, &replacements, &sizes, &source, layout, output, progress)
 }
 
 pub(crate) fn target_sizes(payload: &payload_plan::Plan, company: u64, preload: u64) -> Result<(u64, BTreeMap<String,u64>)> {

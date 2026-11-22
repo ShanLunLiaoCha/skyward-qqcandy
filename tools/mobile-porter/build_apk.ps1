@@ -22,7 +22,7 @@ $classes=Join-Path $build 'classes'; $dex=Join-Path $build 'dex'; $gen=Join-Path
 New-Item -ItemType Directory -Path $classes,$dex,$gen | Out-Null
 $res=Join-Path $build 'res.zip'; $unsigned=Join-Path $build 'unsigned.apk'; $aligned=Join-Path $build 'aligned.apk'
 Run (Join-Path $bt 'aapt2.exe') @('compile','--dir',(Join-Path $app 'res'),'-o',$res)
-Run (Join-Path $bt 'aapt2.exe') @('link','-o',$unsigned,'-I',$android,'--manifest',(Join-Path $app 'AndroidManifest.xml'),'--java',$gen,'--min-sdk-version','30','--target-sdk-version','35','--version-code','8','--version-name','1.9-Fix78','-A',(Join-Path $build 'assets'),$res)
+Run (Join-Path $bt 'aapt2.exe') @('link','-o',$unsigned,'-I',$android,'--manifest',(Join-Path $app 'AndroidManifest.xml'),'--java',$gen,'--min-sdk-version','30','--target-sdk-version','35','--version-code','10','--version-name','2.1-Fix70','-A',(Join-Path $build 'assets'),$res)
 $sources=@(Get-ChildItem -LiteralPath (Join-Path $app 'java'),(Join-Path $project 'backend\src'),$gen -Recurse -Filter '*.java' -File | ForEach-Object {$_.FullName})
 Run 'javac.exe' (@('-encoding','UTF-8','--release','17','-classpath',$android,'-d',$classes)+$sources)
 $jar=Join-Path $build 'compiled.jar'

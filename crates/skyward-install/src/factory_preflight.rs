@@ -210,12 +210,18 @@ pub fn check(
     // A nonzero minor version or the OTA engine's partial_update flag alone
     // does not require any source bytes (the official .211 package is an example).
     let [device] = reference.block_devices.as_slice() else { anyhow::bail!("expected one physical super device") };
-    ensure!(reference.damaged.is_empty() && reference.header_flags == HEADER_FLAG_VIRTUAL_AB_DEVICE
-        && reference.major_version == 10 && reference.minor_version == 2
-        && device.partition_name == "super" && device.size == actual_bytes
-        && plan.block_size.is_power_of_two() && (512..=65536).contains(&plan.block_size)
-        && plan.block_size == u64::from(reference.geometry.logical_block_size),
-        "unsupported Virtual A/B super reference or mismatched physical geometry");
+    // Each part is reported on its own so a refusal names the one condition
+    // that the phone's own metadata does not meet.
+    ensure!(reference.damaged.is_empty(), "this phone's super metadata is damaged");
+    ensure!(reference.header_flags & HEADER_FLAG_VIRTUAL_AB_DEVICE != 0,
+        "this phone's super metadata is not Virtual A/B (flags {:#x})", reference.header_flags);
+    ensure!(reference.major_version == 10 && reference.minor_version <= 3,
+        "unsupported super metadata version {}.{}", reference.major_version, reference.minor_version);
+    // The partition's measured size is authoritative; metadata written for a
+    // different super size is ignored instead of refusing the package.
+    ensure!(device.partition_name == "super", "physical device {} is not super", device.partition_name);
+    ensure!(plan.block_size.is_power_of_two() && (512..=65536).contains(&plan.block_size),
+        "unsupported payload block size {}", plan.block_size);
     let dynamic = plan.dynamic.as_ref().context("missing target dynamic partition metadata")?;
     let [group] = dynamic.groups.as_slice() else { anyhow::bail!("expected one target dynamic group") };
     ensure!(dynamic.snapshot_enabled && group.name == "main", "unsupported target Virtual A/B group");

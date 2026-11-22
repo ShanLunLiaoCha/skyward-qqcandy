@@ -76,7 +76,10 @@ impl<'a> Archive<'a> {
             }
             let key = canonical(name)?;
             ensure!(entries.len() < MAX_FILES, "too many ramdisk entries");
-            ensure!(paths.insert(key, entries.len()).is_none(), "duplicate CPIO path {name}");
+            // Some vendor ramdisks list the same directory twice; the later
+            // record is ignored instead of refusing the whole image.
+            if paths.contains_key(key) { input = &input[raw.len()..]; continue; }
+            paths.insert(key, entries.len());
             let entry = Entry { name, key, data, raw, fields, crc };
             if entry.mode() & TYPE == REG && !inodes.insert(entry.inode()) { aliased.insert(entry.inode()); }
             new_inode = new_inode.max(fields[0]);

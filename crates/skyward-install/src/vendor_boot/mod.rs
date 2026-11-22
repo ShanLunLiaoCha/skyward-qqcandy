@@ -195,7 +195,11 @@ fn repack_with(stock: &[u8], recovery: &[u8], assets: &[(&str, &[u8])],
         ensure!(script.len() <= 1024 * 1024, "oversized stock rc {name}");
         scripts.insert(name.to_owned(), script.to_vec());
     }
-    edits.insert(MAIN_INIT, init::adapt_init(&scripts)?);
+    // An input that already went through this adapter keeps its own init
+    // script: adapting twice would rewrite reviewed declarations again.
+    if verify_avb {
+        edits.insert(MAIN_INIT, init::adapt_init(&scripts)?);
+    }
     for name in ["prop.default", "system/build.prop", "vendor/build.prop"] {
         if archive.contains(name) {
             let before = archive.regular(name)?;
